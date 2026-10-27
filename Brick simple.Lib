@@ -1,26 +1,32 @@
 --[[=========================================================================
-	BrickedLib  v2.0   (patched + expanded)
+	BrickedLib  v2.2   (patched + expanded)
 	Roblox UI library: window / tabs / elements / notifications / configs.
 
-	PATCHES
-	  * icons: TextService:GetIcon() -> BuilderIcons font (with auto glyph
-	    fallback if the font is unavailable on the client)
-	  * slider: snapping now measured from Min (was from 0, Min unreachable)
-	  * slider: decimal precision derived from Increment (0.25 no longer
-	    renders as "0.2"), 20px hit strip instead of a 6px one, click value
-	    label to type an exact number
-	  * makeDraggable: no longer leaks an InputObject.Changed connection on
-	    every single drag start
-	  * per-window theme -- a 2nd window with a different accent no longer
-	    recolours the 1st
-	  * unified callback contract: never fires on creation, Set(v, silent)
-	  * dropdown: index-safe selection, dedupe, correct single-select,
-	    optional search filter
-	  * ScreenGui renamed, dead helpers wired up
-	NEW
-	  * Section / Divider / Paragraph / Keybind / Progress / Image
-	  * flags registry + JSON config save/load/autosave
-	  * notification types, UI scale, tab remove, window title/accent
+	v2.2
+	  * FIX: windows stuck to the cursor after a drag. The v2.1 leak fix
+	    replaced the per-input input.Changed handler with a global identity
+	    check, but the movement handler still overwrote the variable used
+	    for that check -- so the release never matched and `dragging` stayed
+	    true. Drag identity now lives in activeInput and the release is
+	    matched by input TYPE, not identity. bindDrag had the same defect
+	    (sliders / colour pickers kept tracking off-widget) -- fixed too.
+	  * window focus loss now also cancels an in-progress drag.
+
+	v2.1
+	  * FIX: "Key 'Destroy' not found" -- window control buttons were wired
+	    up before the Window methods existed, so the analyzer resolved
+	    Window:Destroy() against an incomplete table. All methods are now
+	    declared before anything references them.
+	  * FIX: "Unknown global 'writeclipboard'" -- clipboard helpers now go
+	    through getgenv() instead of bare globals.
+	  * FIX: "SameLineStatement" -- semicolons in SelectTab / RemoveTab.
+	  * FIX: same late-binding pattern in the dropdown (api._toggle was
+	    referenced by rebuild() before assignment).
+	  * icons: TextService:GetIcon() -> BuilderIcons font (auto glyph
+	    fallback if the font is missing on the client)
+	  * slider: snapping measured from Min, precision from Increment,
+	    20px hit strip, click the value to type an exact number
+	  * per-window theme; unified Set(v, silent) callback contract
 =========================================================================]]
 
 --=========================================================================
@@ -28,11 +34,9 @@
 --=========================================================================
 local TweenService     = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
-local RunService       = game:GetService("RunService")
 local HttpService      = game:GetService("HttpService")
 local Players          = game:GetService("Players")
 local TextService      = game:GetService("TextService")
-local Lighting         = game:GetService("Lighting")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -74,8 +78,6 @@ local ICON_FONT = Font.new(
 	"rbxasset://LuaPackages/Packages/_Index/BuilderIcons/BuilderIcons/BuilderIcons.json"
 )
 
--- Last-resort unicode substitutes, used when the BuilderIcons font is not
--- present on the running client (old versions / some mobile builds).
 local GLYPHS = {
 	["xmark"] = "✕", ["minus"] = "—", ["plus"] = "＋",
 	["chevron-down"] = "⌄", ["chevron-up"] = "⌃", ["chevron-right"] = "›",
@@ -85,6 +87,12 @@ local GLYPHS = {
 	["trash"] = "🗑", ["floppy-disk"] = "💾", ["arrows-rotate"] = "⟳",
 	["house"] = "⌂", ["star"] = "★", ["paper-plane"] = "➤", ["play"] = "▶",
 	["stop"] = "■", ["crosshairs"] = "⊕", ["wand"] = "✦", ["eye"] = "👁",
+	["sliders"] = "☰", ["layer-group"] = "▤", ["code"] = "⌨", ["link"] = "🔗",
+	["download"] = "⤓", ["upload"] = "⤒", ["clock"] = "🕑", ["flag"] = "⚑",
+	["fire"] = "🔥", ["snowflake"] = "❄", ["sword"] = "⚔", ["shield"] = "🛡",
+	["cube"] = "◧", ["object-group"] = "⧉", ["thumbtack"] = "📌",
+	["arrows-up-down"] = "⇅", ["wand-magic-sparkles"] = "✨", ["palette"] = "🎨",
+	["list"] = "≡", ["font"] = "A", ["magnifying-glass-plus"] = "⌕",
 }
 
 --=========================================================================
@@ -141,8 +149,6 @@ end
 
 ----------------------------------------------------------------------
 -- ICON
--- One-time probe: if a ligature word renders roughly square, the icon
--- font resolved and we can use it. Otherwise fall back to glyphs.
 ----------------------------------------------------------------------
 local _iconFontOK
 local function iconFontOK()
@@ -180,11 +186,7 @@ local function icon(name, size, color)
 		TextYAlignment = Enum.TextYAlignment.Center,
 	})
 
-	create("UITextSizeConstraint", {
-		MaxTextSize = size,
-		MinTextSize = 1,
-		Parent = label,
-	})
+	create("UITextSizeConstraint", { MaxTextSize = size, MinTextSize = 1, Parent = label })
 
 	return label
 end
@@ -192,47 +194,66 @@ end
 ----------------------------------------------------------------------
 -- DRAG
 ----------------------------------------------------------------------
+local function isDragStart(input)
+	return input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch
+end
+
+-- movement / release matching. Mouse has no per-drag InputObject for
+-- movement (it arrives as MouseMovement), so identity only applies to touch.
+local function isDragMove(input, activeInput)
+	if input.UserInputType == Enum.UserInputType.MouseMovement then
+		return true
+	end
+	return input.UserInputType == Enum.UserInputType.Touch and input == activeInput
+end
+
 local function makeDraggable(frame, handle)
-	local dragging, dragInput, startPos, startFramePos
+	local dragging = false
+	local activeInput = nil
+	local startPos, startFramePos
+
+	local function stop()
+		dragging = false
+		activeInput = nil
+	end
 
 	handle.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1
-			or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			dragInput = input
-			startPos = input.Position
-			startFramePos = frame.Position
-		end
+		if not isDragStart(input) then return end
+		dragging = true
+		activeInput = input          -- never overwritten while dragging
+		startPos = input.Position
+		startFramePos = frame.Position
 	end)
 
-	handle.InputChanged:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseMovement
-			or input.UserInputType == Enum.UserInputType.Touch then
-			dragInput = input
-		end
-	end)
-
-	-- ONE global end handler instead of a fresh input.Changed connection
-	-- per mouse-down (that was the leak).
+	-- matched by TYPE, not identity: the movement handler used to clobber the
+	-- variable the old identity check relied on, so the release never landed
+	-- and the window kept following the cursor forever.
 	track(UserInputService.InputEnded:Connect(function(input)
-		if input == dragInput then
-			dragging = false
-			dragInput = nil
+		if not dragging then return end
+		if input == activeInput
+			or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			stop()
 		end
 	end))
 
-	track(UserInputService.InputChanged:Connect(function(inp)
-		if inp == dragInput and dragging then
-			local delta = inp.Position - startPos
-			frame.Position = UDim2.new(
-				startFramePos.X.Scale, startFramePos.X.Offset + delta.X,
-				startFramePos.Y.Scale, startFramePos.Y.Offset + delta.Y)
-		end
+	-- alt-tab / focus loss mid-drag would otherwise strand the drag
+	track(UserInputService.WindowFocusReleased:Connect(stop))
+
+	track(UserInputService.InputChanged:Connect(function(input)
+		if not dragging then return end
+		if not isDragMove(input, activeInput) then return end
+
+		local delta = input.Position - startPos
+		frame.Position = UDim2.new(
+			startFramePos.X.Scale, startFramePos.X.Offset + delta.X,
+			startFramePos.Y.Scale, startFramePos.Y.Offset + delta.Y)
 	end))
 end
 
 local function bindDrag(frame, cb)
 	local dragging = false
+	local activeInput = nil
 
 	local function fire(input)
 		local rel = input.Position - frame.AbsolutePosition
@@ -241,26 +262,33 @@ local function bindDrag(frame, cb)
 		cb(nx, ny)
 	end
 
+	local function stop()
+		dragging = false
+		activeInput = nil
+	end
+
 	frame.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1
-			or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			fire(input)
-		end
+		if not isDragStart(input) then return end
+		dragging = true
+		activeInput = input
+		fire(input)
 	end)
 
-	frame.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1
-			or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = false
+	-- GuiObject.InputEnded only fires while the pointer is over the widget, so
+	-- releasing off-widget used to leave sliders and colour pickers tracking.
+	track(UserInputService.InputEnded:Connect(function(input)
+		if not dragging then return end
+		if input == activeInput
+			or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			stop()
 		end
-	end)
+	end))
+
+	track(UserInputService.WindowFocusReleased:Connect(stop))
 
 	track(UserInputService.InputChanged:Connect(function(input)
-		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-			or input.UserInputType == Enum.UserInputType.Touch) then
-			fire(input)
-		end
+		if not dragging then return end
+		if isDragMove(input, activeInput) then fire(input) end
 	end))
 end
 
@@ -275,9 +303,10 @@ end
 
 local function copyToClipboard(text)
 	pcall(function()
-		if setclipboard then setclipboard(text)
-		elseif toclipboard then toclipboard(text)
-		elseif writeclipboard then writeclipboard(text) end
+		local env = getgenv and getgenv() or _G
+		local fn = env.setclipboard or env.toclipboard or env.writeclipboard
+			or rawget(_G, "setclipboard") or rawget(_G, "toclipboard") or rawget(_G, "writeclipboard")
+		if fn then fn(text) end
 	end)
 end
 
@@ -300,7 +329,8 @@ local function openDiscordInvite(code)
 			},
 			Body = body,
 		}
-		if request then request(opts) else HttpService:RequestAsync(opts) end
+		local env = getgenv and getgenv() or _G
+		if env.request then env.request(opts) else HttpService:RequestAsync(opts) end
 	end)
 
 	if not ok then copyToClipboard("discord.gg/" .. code) end
@@ -308,7 +338,7 @@ local function openDiscordInvite(code)
 end
 
 --=========================================================================
--- VALUE PACKING (Color3 survives JSON round-trips)
+-- VALUE PACKING
 --=========================================================================
 local function packValue(v)
 	if typeof(v) == "Color3" then
@@ -361,15 +391,15 @@ local NotifHolder = create("Frame", {
 --=========================================================================
 local Library = { _windows = {}, _registry = {}, Flags = {} }
 Library.__index = Library
-Library.Version = "2.0"
+Library.Version = "2.2"
 Library.Connections = Connections
 Library.ScreenGui = ScreenGui
 
 Library.NotifyTypes = {
-	Info    = { Icon = "circle-info",         Color = Theme.Accent },
-	Success = { Icon = "check",               Color = Theme.Good },
+	Info    = { Icon = "circle-info",          Color = Theme.Accent },
+	Success = { Icon = "check",                Color = Theme.Good },
 	Warn    = { Icon = "triangle-exclamation", Color = Theme.Warn },
-	Error   = { Icon = "xmark",               Color = Theme.Bad },
+	Error   = { Icon = "xmark",                Color = Theme.Bad },
 }
 
 function Library:Destroy()
@@ -603,7 +633,6 @@ function Library:Notify(ncfg)
 
 	tween(card, TI_S, { BackgroundTransparency = 0, Position = UDim2.new(0, 0, 0, 0) })
 
-	local lifetime = ncfg.Duration or 4
 	local conn
 	if ncfg.Callback then
 		conn = card.InputBegan:Connect(function(i)
@@ -614,7 +643,7 @@ function Library:Notify(ncfg)
 		end)
 	end
 
-	task.delay(lifetime, function()
+	task.delay(ncfg.Duration or 4, function()
 		if conn then conn:Disconnect() end
 		tween(card, TI, { BackgroundTransparency = 1, Position = UDim2.new(0, 26, 0, 0) })
 		task.wait(0.2)
@@ -686,7 +715,7 @@ function TabMethods:CreateSection(scfg)
 		Parent = wrap,
 	})
 
-	local line = create("Frame", {
+	create("Frame", {
 		Size = UDim2.new(1, 0, 0, 1),
 		BackgroundColor3 = self._theme.Stroke,
 		BorderSizePixel = 0,
@@ -965,8 +994,7 @@ function TabMethods:CreateToggle(tcfg)
 	})
 	hit.Activated:Connect(function() api:Set(not state) end)
 
-	-- contract: never fires the callback during construction
-	tween(trackBg, TI, { BackgroundColor3 = state and T.Accent or T.Tertiary })
+	trackBg.BackgroundColor3 = state and T.Accent or T.Tertiary
 	knob.Position = state and UDim2.new(1, -16, 0.5, 0) or UDim2.new(0, 2, 0.5, 0)
 	Library:_flag(id, state)
 
@@ -1346,7 +1374,6 @@ function TabMethods:CreateSlider(scfg)
 	local span = max - min
 
 	local function snap(raw)
-		-- measured from Min, not from 0 -- Min is now actually reachable
 		local steps = math.floor((math.clamp(raw, min, max) - min) / inc + 0.5)
 		return math.clamp(min + steps * inc, min, max)
 	end
@@ -1362,7 +1389,6 @@ function TabMethods:CreateSlider(scfg)
 
 	render(false)
 
-	-- the whole 20px strip is grabbable now, not just the 6px bar
 	bindDrag(barWrap, function(nx)
 		value = snap(min + span * nx)
 		render(true)
@@ -1607,8 +1633,8 @@ function TabMethods:CreateColorPicker(ccfg)
 	stroke(hueCursor, Color3.new(0, 0, 0), 2)
 
 	local hexBox = create("TextBox", {
-		Position = UDim2.new(0, 0, 0, 112),
-		Size = UDim2.new(1, -26, 0, 22),
+		Position = UDim2.new(0, 128, 0, 112),
+		Size = UDim2.new(1, -128, 0, 22),
 		BackgroundColor3 = T.Tertiary,
 		BorderSizePixel = 0,
 		FontFace = FONT_REG,
@@ -1643,9 +1669,6 @@ function TabMethods:CreateColorPicker(ccfg)
 			SortOrder = Enum.SortOrder.LayoutOrder,
 		}),
 	})
-
-	hexBox.Position = UDim2.new(0, 128, 0, 112)
-	hexBox.Size = UDim2.new(1, -128, 0, 22)
 
 	local api = { Instance = row, Color = color }
 
@@ -1737,12 +1760,11 @@ function TabMethods:CreateDropdown(dcfg)
 
 	local multi = dcfg.Multi or false
 	local searchable = dcfg.Search or false
-	local selected = {}      -- keyed by option string, deduped
+	local selected = {}
 	local optionBtns = {}
 	local open = false
 
 	local ROW_H = 36
-	local MAX_LIST = 260
 	local OPT_H = 28
 
 	local row = create("Frame", {
@@ -1858,7 +1880,7 @@ function TabMethods:CreateDropdown(dcfg)
 	local function selectedList()
 		local out = {}
 		for _, o in options do
-			if selected[o] then table.insert(out, o) end
+			if selected[tostring(o)] then table.insert(out, o) end
 		end
 		return out
 	end
@@ -1868,9 +1890,34 @@ function TabMethods:CreateDropdown(dcfg)
 		if #names == 0 then
 			valLbl.Text = dcfg.Placeholder or ""
 		elseif multi then
-			valLbl.Text = #names == 1 and names[1] or (#names .. " selected")
+			valLbl.Text = #names == 1 and tostring(names[1]) or (#names .. " selected")
 		else
-			valLbl.Text = names[1]
+			valLbl.Text = tostring(names[1])
+		end
+	end
+
+	function api._toggle(force)
+		open = (force ~= nil) and force or not open
+
+		if open then
+			list.Visible = true
+			if searchBox then
+				searchBox.Visible = true
+				searchBox.Text = ""
+				for _, b in optionBtns do b.btn.Visible = true end
+			end
+			list.Size = UDim2.new(1, 0, 0, openHeight() - (searchable and 64 or 36))
+			tween(row, TI, { Size = UDim2.new(1, 0, 0, openHeight()) })
+		else
+			list.Visible = false
+			if searchBox then searchBox.Visible = false end
+			tween(row, TI, { Size = UDim2.new(1, 0, 0, ROW_H) })
+		end
+
+		if iconFontOK() then
+			chev.Text = open and "chevron-up" or "chevron-down"
+		else
+			chev.Text = open and GLYPHS["chevron-up"] or GLYPHS["chevron-down"]
 		end
 	end
 
@@ -1878,7 +1925,6 @@ function TabMethods:CreateDropdown(dcfg)
 		for _, b in optionBtns do b.btn:Destroy() end
 		table.clear(optionBtns)
 
-		-- dedupe, preserving order
 		local seen, unique = {}, {}
 		for _, o in options do
 			local k = tostring(o)
@@ -1909,7 +1955,7 @@ function TabMethods:CreateDropdown(dcfg)
 				Position = UDim2.new(0, 10, 0, 0),
 				Size = UDim2.new(1, -40, 1, 0),
 				FontFace = FONT_REG,
-				Text = tostring(opt),
+				Text = key,
 				TextSize = 12,
 				TextColor3 = T.Text,
 				TextXAlignment = Enum.TextXAlignment.Left,
@@ -1965,29 +2011,6 @@ function TabMethods:CreateDropdown(dcfg)
 		end)
 	end
 
-	function api._toggle(force)
-		open = (force ~= nil) and force or not open
-		if open then
-			list.Visible = true
-			if searchBox then
-				searchBox.Visible = true
-				searchBox.Text = ""
-				for _, b in optionBtns do b.btn.Visible = true end
-			end
-			list.Size = UDim2.new(1, 0, 0, openHeight() - (searchable and 64 or 36))
-			tween(row, TI, { Size = UDim2.new(1, 0, 0, openHeight()) })
-		else
-			list.Visible = false
-			if searchBox then searchBox.Visible = false end
-			tween(row, TI, { Size = UDim2.new(1, 0, 0, ROW_H) })
-		end
-
-		chev.Text = open and "chevron-up" or "chevron-down"
-		if not iconFontOK() then
-			chev.Text = open and GLYPHS["chevron-up"] or GLYPHS["chevron-down"]
-		end
-	end
-
 	header.Activated:Connect(function() api._toggle() end)
 
 	function api:Set(val, silent)
@@ -1999,7 +2022,6 @@ function TabMethods:CreateDropdown(dcfg)
 					if x ~= nil then selected[tostring(x)] = true end
 				end
 			else
-				-- single-select given a table: take the first entry only
 				local first = val[1]
 				if first ~= nil then selected[tostring(first)] = true end
 			end
@@ -2147,12 +2169,6 @@ function Library:CreateWindow(cfg)
 		return btn
 	end
 
-	ctrlBtn("xmark", -12, function() Window:Destroy() end)
-	ctrlBtn("minus", -42, function()
-		hidden = not hidden
-		BG.Visible = not hidden
-	end)
-
 	local Content = create("Frame", {
 		Name = "Content",
 		Position = UDim2.new(0, 0, 0, 40),
@@ -2191,7 +2207,6 @@ function Library:CreateWindow(cfg)
 		local name = tcfg.Name or "Tab"
 
 		local Tab = setmetatable({ _order = 0, _theme = T }, TabMethods)
-		Tab._registry = {}
 
 		local btn = create("TextButton", {
 			Name = name,
@@ -2299,10 +2314,14 @@ function Library:CreateWindow(cfg)
 
 	function Window:SelectTab(nameOrIndex)
 		local tab
-		if type(nameOrIndex) == "number" then tab = Window.Tabs[nameOrIndex]
+		if type(nameOrIndex) == "number" then
+			tab = Window.Tabs[nameOrIndex]
 		else
 			for _, t in Window.Tabs do
-				if t.Name == nameOrIndex then tab = t break end
+				if t.Name == nameOrIndex then
+					tab = t
+					break
+				end
 			end
 		end
 		if tab and tab._btn then tab._btn.Activated:Fire() end
@@ -2312,13 +2331,24 @@ function Library:CreateWindow(cfg)
 	function Window:RemoveTab(nameOrIndex)
 		local idx, tab
 		if type(nameOrIndex) == "number" then
-			idx, tab = nameOrIndex, Window.Tabs[nameOrIndex]
+			idx = nameOrIndex
+			tab = Window.Tabs[nameOrIndex]
 		else
 			for i, t in Window.Tabs do
-				if t.Name == nameOrIndex then idx, tab = i, t break end
+				if t.Name == nameOrIndex then
+					idx = i
+					tab = t
+					break
+				end
 			end
 		end
 		if not tab then return false end
+
+		for id, api in Library._registry do
+			if api.Instance and api.Instance:IsDescendantOf(tab._wrap) then
+				Library:_unbind(id)
+			end
+		end
 
 		tab._btn:Destroy()
 		tab._wrap:Destroy()
@@ -2326,10 +2356,8 @@ function Library:CreateWindow(cfg)
 
 		if Window._current == tab then
 			Window._current = nil
-			if Window.Tabs[1] then
-				local nextTab = Window.Tabs[1]
-				nextTab._btn.Activated:Fire()
-			end
+			local nextTab = Window.Tabs[1]
+			if nextTab then nextTab._btn.Activated:Fire() end
 		end
 		return true
 	end
@@ -2378,6 +2406,12 @@ function Library:CreateWindow(cfg)
 		task.wait(0.18)
 		BG:Destroy()
 	end
+
+	ctrlBtn("xmark", -12, function() Window:Destroy() end)
+	ctrlBtn("minus", -42, function()
+		hidden = not hidden
+		BG.Visible = not hidden
+	end)
 
 	toggleConn = track(UserInputService.InputBegan:Connect(function(inp, gp)
 		if gp then return end
