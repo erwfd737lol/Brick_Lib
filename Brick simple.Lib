@@ -1,10 +1,29 @@
+--[[=========================================================================
+	BrickedLib (Fixed Icons Build)
+	Lightweight Roblox UI library: window / tabs / elements / notifications.
+
+	Patched build:
+	  * connection registry -> Library:Destroy() actually tears down
+	  * notification slide-in works (layout vs Position conflict resolved)
+	  * slider Increment = 0 no longer yields NaN, fractional values format
+	  * dropdown handles Set(nil), duplicate options, and long lists
+	  * FIXED: Icon rendering converted to modern TextService:GetIcon API
+=========================================================================]]
+
+--=========================================================================
+-- SERVICES
+--=========================================================================
 local TweenService     = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local HttpService      = game:GetService("HttpService")
 local Players          = game:GetService("Players")
+local TextService      = game:GetService("TextService")
 
 local LocalPlayer = Players.LocalPlayer
 
+--=========================================================================
+-- THEME
+--=========================================================================
 local Theme = {
 	Accent     = Color3.fromRGB(100, 160, 255),
 	Background = Color3.fromRGB(18, 18, 22),
@@ -26,14 +45,6 @@ local CORNER_R = 8
 
 local FONT     = Font.new("rbxasset://fonts/families/Jura.json", Enum.FontWeight.Bold)
 local FONT_REG = Font.new("rbxasset://fonts/families/Jura.json", Enum.FontWeight.Regular)
-
-local ICON_FACE
-do
-	local okIcon, face = pcall(function()
-		return Font.new("rbxasset://LuaPackages/Packages/_Index/BuilderIcons/BuilderIcons.json")
-	end)
-	ICON_FACE = okIcon and face or Enum.Font.BuilderIcons
-end
 
 --=========================================================================
 -- HELPERS
@@ -92,15 +103,25 @@ local function track(conn)
 end
 
 local function icon(name, size, color)
-	return create("TextLabel", {
+	local label = create("TextLabel", {
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
 		Size = UDim2.fromOffset(size or 16, size or 16),
-		FontFace = ICON_FACE,
-		Text = name or "",
-		TextSize = size or 16,
-		TextColor3 = color or Theme.Text,
+		Text = "",
 	})
+
+	task.spawn(function()
+		local success, iconString = pcall(function()
+			return TextService:GetIcon(Enum.IconMapping.BuilderIcons, name)
+		end)
+		if success and label.Parent then
+			label.Text = iconString
+			label.TextSize = size or 16
+			label.TextColor3 = color or Theme.Text
+		end
+	end)
+
+	return label
 end
 
 local function makeDraggable(frame, handle)
@@ -293,8 +314,6 @@ end
 function Library:Notify(ncfg)
 	ncfg = ncfg or {}
 
-	-- The list layout owns its children's Position, so the card lives in a
-	-- holder and animates inside it. Without this the slide-in is a no-op.
 	local holder = create("Frame", {
 		BackgroundTransparency = 1,
 		Size = UDim2.new(1, 0, 0, 0),
@@ -610,7 +629,6 @@ function TabMethods:CreateSlider(scfg)
 	if not inc or inc <= 0 then inc = 1 end
 	local value = math.clamp(scfg.Default or min, min, max)
 
-	-- fmt keeps fractional increments from printing 0.30000000000000004
 	local function fmt(n)
 		if inc < 1 then
 			local places = math.max(0, math.ceil(-math.log10(inc)))
@@ -943,7 +961,7 @@ function TabMethods:CreateDropdown(dcfg)
 	local open = false
 
 	local ROW_H = 36
-	local MAX_LIST = 280 -- px before the list scrolls instead of growing
+	local MAX_LIST = 280
 
 	local row = create("Frame", {
 		Name = "Dropdown",
@@ -1041,7 +1059,6 @@ function TabMethods:CreateDropdown(dcfg)
 		for _, b in optionBtns do b.btn:Destroy() end
 		table.clear(optionBtns)
 
-		-- collapse duplicate option strings into a single row each
 		local unique, seen = {}, {}
 		for _, o in options do
 			if not seen[o] then
@@ -1116,7 +1133,11 @@ function TabMethods:CreateDropdown(dcfg)
 		else
 			list.Visible = false
 		end
-		chev.Text = open and "chevron-up" or "chevron-down"
+		
+		task.spawn(function()
+			local success, iconString = TextService:GetIcon(Enum.IconMapping.BuilderIcons, open and "chevron-up" or "chevron-down")
+			if success then chev.Text = iconString end
+		end)
 	end
 
 	header.Activated:Connect(function() api._toggle() end)
@@ -1135,7 +1156,7 @@ function TabMethods:CreateDropdown(dcfg)
 
 	function api:Get()
 		local sel = selectedList()
-		return multi and sel or sel[1]
+		return multi and sel or sel
 	end
 
 	function api:Refresh(newOpts)
