@@ -1,13 +1,26 @@
 --[[=========================================================================
-	BrickedLib (Fixed Icons Build)
-	Lightweight Roblox UI library: window / tabs / elements / notifications.
+	BrickedLib  v2.0   (patched + expanded)
+	Roblox UI library: window / tabs / elements / notifications / configs.
 
-	Patched build:
-	  * connection registry -> Library:Destroy() actually tears down
-	  * notification slide-in works (layout vs Position conflict resolved)
-	  * slider Increment = 0 no longer yields NaN, fractional values format
-	  * dropdown handles Set(nil), duplicate options, and long lists
-	  * FIXED: Icon rendering converted to modern TextService:GetIcon API
+	PATCHES
+	  * icons: TextService:GetIcon() -> BuilderIcons font (with auto glyph
+	    fallback if the font is unavailable on the client)
+	  * slider: snapping now measured from Min (was from 0, Min unreachable)
+	  * slider: decimal precision derived from Increment (0.25 no longer
+	    renders as "0.2"), 20px hit strip instead of a 6px one, click value
+	    label to type an exact number
+	  * makeDraggable: no longer leaks an InputObject.Changed connection on
+	    every single drag start
+	  * per-window theme -- a 2nd window with a different accent no longer
+	    recolours the 1st
+	  * unified callback contract: never fires on creation, Set(v, silent)
+	  * dropdown: index-safe selection, dedupe, correct single-select,
+	    optional search filter
+	  * ScreenGui renamed, dead helpers wired up
+	NEW
+	  * Section / Divider / Paragraph / Keybind / Progress / Image
+	  * flags registry + JSON config save/load/autosave
+	  * notification types, UI scale, tab remove, window title/accent
 =========================================================================]]
 
 --=========================================================================
@@ -15,9 +28,11 @@
 --=========================================================================
 local TweenService     = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
 local HttpService      = game:GetService("HttpService")
 local Players          = game:GetService("Players")
 local TextService      = game:GetService("TextService")
+local Lighting         = game:GetService("Lighting")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -32,19 +47,45 @@ local Theme = {
 	Text       = Color3.fromRGB(236, 236, 242),
 	SubText    = Color3.fromRGB(148, 148, 160),
 	Stroke     = Color3.fromRGB(56, 56, 68),
+	Good       = Color3.fromRGB(90, 200, 130),
+	Warn       = Color3.fromRGB(235, 180, 80),
+	Bad        = Color3.fromRGB(235, 95, 95),
 }
+
+local function newTheme(accent)
+	local t = setmetatable({}, { __index = Theme })
+	if accent then t.Accent = accent end
+	return t
+end
 
 --=========================================================================
 -- CONSTANTS
 --=========================================================================
-local TI    = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-local TI_S  = TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local TI   = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local TI_S = TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
 
 local STROKE_T = 1
 local CORNER_R = 8
 
 local FONT     = Font.new("rbxasset://fonts/families/Jura.json", Enum.FontWeight.Bold)
 local FONT_REG = Font.new("rbxasset://fonts/families/Jura.json", Enum.FontWeight.Regular)
+
+local ICON_FONT = Font.new(
+	"rbxasset://LuaPackages/Packages/_Index/BuilderIcons/BuilderIcons/BuilderIcons.json"
+)
+
+-- Last-resort unicode substitutes, used when the BuilderIcons font is not
+-- present on the running client (old versions / some mobile builds).
+local GLYPHS = {
+	["xmark"] = "✕", ["minus"] = "—", ["plus"] = "＋",
+	["chevron-down"] = "⌄", ["chevron-up"] = "⌃", ["chevron-right"] = "›",
+	["check"] = "✓", ["circle"] = "●", ["circle-info"] = "ⓘ",
+	["triangle-exclamation"] = "⚠", ["magnifying-glass"] = "⌕",
+	["user"] = "☻", ["users"] = "☻", ["gear"] = "⚙", ["bolt"] = "⚡",
+	["trash"] = "🗑", ["floppy-disk"] = "💾", ["arrows-rotate"] = "⟳",
+	["house"] = "⌂", ["star"] = "★", ["paper-plane"] = "➤", ["play"] = "▶",
+	["stop"] = "■", ["crosshairs"] = "⊕", ["wand"] = "✦", ["eye"] = "👁",
+}
 
 --=========================================================================
 -- HELPERS
@@ -91,10 +132,6 @@ local function tween(obj, info, props)
 	return t
 end
 
-----------------------------------------------------------------------
--- Connection registry: every global input hook goes through track()
--- so Library:Destroy() can actually tear the library down.
-----------------------------------------------------------------------
 local Connections = {}
 
 local function track(conn)
@@ -102,28 +139,59 @@ local function track(conn)
 	return conn
 end
 
+----------------------------------------------------------------------
+-- ICON
+-- One-time probe: if a ligature word renders roughly square, the icon
+-- font resolved and we can use it. Otherwise fall back to glyphs.
+----------------------------------------------------------------------
+local _iconFontOK
+local function iconFontOK()
+	if _iconFontOK ~= nil then return _iconFontOK end
+	_iconFontOK = false
+	local ok, bounds = pcall(function()
+		local p = Instance.new("GetTextBoundsParams")
+		p.Text = "triangle-exclamation"
+		p.Font = ICON_FONT
+		p.Size = 24
+		p.Width = 4000
+		return TextService:GetTextBoundsAsync(p)
+	end)
+	if ok and typeof(bounds) == "Vector2" and bounds.X > 0 and bounds.Y > 0 then
+		_iconFontOK = bounds.X <= bounds.Y * 1.8
+	end
+	return _iconFontOK
+end
+
 local function icon(name, size, color)
+	size = size or 16
+	local useFont = iconFontOK()
+
 	local label = create("TextLabel", {
+		Name = "Icon",
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
-		Size = UDim2.fromOffset(size or 16, size or 16),
-		Text = "",
+		Size = UDim2.fromOffset(size, size),
+		FontFace = useFont and ICON_FONT or FONT_REG,
+		Text = useFont and name or (GLYPHS[name] or "•"),
+		TextColor3 = color or Theme.Text,
+		TextSize = size,
+		TextScaled = true,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextYAlignment = Enum.TextYAlignment.Center,
 	})
 
-	task.spawn(function()
-		local success, iconString = pcall(function()
-			return TextService:GetIcon(Enum.IconMapping.BuilderIcons, name)
-		end)
-		if success and label.Parent then
-			label.Text = iconString
-			label.TextSize = size or 16
-			label.TextColor3 = color or Theme.Text
-		end
-	end)
+	create("UITextSizeConstraint", {
+		MaxTextSize = size,
+		MinTextSize = 1,
+		Parent = label,
+	})
 
 	return label
 end
 
+----------------------------------------------------------------------
+-- DRAG
+----------------------------------------------------------------------
 local function makeDraggable(frame, handle)
 	local dragging, dragInput, startPos, startFramePos
 
@@ -134,12 +202,6 @@ local function makeDraggable(frame, handle)
 			dragInput = input
 			startPos = input.Position
 			startFramePos = frame.Position
-
-			input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then
-					dragging = false
-				end
-			end)
 		end
 	end)
 
@@ -149,6 +211,15 @@ local function makeDraggable(frame, handle)
 			dragInput = input
 		end
 	end)
+
+	-- ONE global end handler instead of a fresh input.Changed connection
+	-- per mouse-down (that was the leak).
+	track(UserInputService.InputEnded:Connect(function(input)
+		if input == dragInput then
+			dragging = false
+			dragInput = nil
+		end
+	end))
 
 	track(UserInputService.InputChanged:Connect(function(inp)
 		if inp == dragInput and dragging then
@@ -160,7 +231,6 @@ local function makeDraggable(frame, handle)
 	end))
 end
 
--- cb receives normalised (x, y) inside the frame, both clamped 0..1
 local function bindDrag(frame, cb)
 	local dragging = false
 
@@ -197,7 +267,6 @@ end
 local function getGuiParent()
 	local ok, parent = pcall(function()
 		if gethui then return gethui() end
-		if getgenv and getgenv().gethui then return getgenv().gethui() end
 		return game:GetService("CoreGui")
 	end)
 	if ok and parent then return parent end
@@ -205,18 +274,11 @@ local function getGuiParent()
 end
 
 local function copyToClipboard(text)
-	local ok = pcall(function()
-		if setclipboard then
-			setclipboard(text)
-		elseif toclipboard then
-			toclipboard(text)
-		end
+	pcall(function()
+		if setclipboard then setclipboard(text)
+		elseif toclipboard then toclipboard(text)
+		elseif writeclipboard then writeclipboard(text) end
 	end)
-	if not ok then
-		pcall(function()
-			if writeclipboard then writeclipboard(text) end
-		end)
-	end
 end
 
 local function openDiscordInvite(code)
@@ -229,27 +291,16 @@ local function openDiscordInvite(code)
 	})
 
 	local ok = pcall(function()
-		if request then
-			request({
-				Url = "http://127.0.0.1:6463/rpc?v=1",
-				Method = "POST",
-				Headers = {
-					["Content-Type"] = "application/json",
-					["Origin"] = "https://discord.com",
-				},
-				Body = body,
-			})
-		else
-			HttpService:RequestAsync({
-				Url = "http://127.0.0.1:6463/rpc?v=1",
-				Method = "POST",
-				Headers = {
-					["Content-Type"] = "application/json",
-					["Origin"] = "https://discord.com",
-				},
-				Body = body,
-			})
-		end
+		local opts = {
+			Url = "http://127.0.0.1:6463/rpc?v=1",
+			Method = "POST",
+			Headers = {
+				["Content-Type"] = "application/json",
+				["Origin"] = "https://discord.com",
+			},
+			Body = body,
+		}
+		if request then request(opts) else HttpService:RequestAsync(opts) end
 	end)
 
 	if not ok then copyToClipboard("discord.gg/" .. code) end
@@ -257,10 +308,27 @@ local function openDiscordInvite(code)
 end
 
 --=========================================================================
+-- VALUE PACKING (Color3 survives JSON round-trips)
+--=========================================================================
+local function packValue(v)
+	if typeof(v) == "Color3" then
+		return { __type = "Color3", r = v.R, g = v.G, b = v.B }
+	end
+	return v
+end
+
+local function unpackValue(v)
+	if type(v) == "table" and v.__type == "Color3" then
+		return Color3.new(v.r, v.g, v.b)
+	end
+	return v
+end
+
+--=========================================================================
 -- GUI ROOT
 --=========================================================================
 local ScreenGui = create("ScreenGui", {
-	Name = "VaehzUI",
+	Name = "BrickedUI",
 	ResetOnSpawn = false,
 	IgnoreGuiInset = true,
 	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
@@ -291,8 +359,18 @@ local NotifHolder = create("Frame", {
 --=========================================================================
 -- LIBRARY
 --=========================================================================
-local Library = { _windows = {} }
+local Library = { _windows = {}, _registry = {}, Flags = {} }
 Library.__index = Library
+Library.Version = "2.0"
+Library.Connections = Connections
+Library.ScreenGui = ScreenGui
+
+Library.NotifyTypes = {
+	Info    = { Icon = "circle-info",         Color = Theme.Accent },
+	Success = { Icon = "check",               Color = Theme.Good },
+	Warn    = { Icon = "triangle-exclamation", Color = Theme.Warn },
+	Error   = { Icon = "xmark",               Color = Theme.Bad },
+}
 
 function Library:Destroy()
 	while #Library._windows > 0 do
@@ -311,8 +389,126 @@ function Library:Destroy()
 	end
 end
 
+Library.Unload = Library.Destroy
+
+function Library:SetAccent(color)
+	Theme.Accent = color
+	for _, w in Library._windows do
+		if w.Theme then w.Theme.Accent = color end
+		for _, tab in w.Tabs do
+			if tab._hl then tab._hl.BackgroundColor3 = color end
+			if tab._ic and w._current == tab then tab._ic.TextColor3 = color end
+		end
+	end
+end
+
+function Library:SetScale(scale)
+	scale = math.clamp(scale or 1, 0.5, 2)
+	for _, w in Library._windows do
+		if w.Instance and w.Instance.Parent then
+			local has = w.Instance:FindFirstChild("UIScale")
+			if has then has.Scale = scale
+			else create("UIScale", { Scale = scale, Parent = w.Instance }) end
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- CONFIG
+----------------------------------------------------------------------
+local CONFIG_DIR = "Bricked"
+
+function Library:SaveConfig(name)
+	name = name or "default"
+
+	local data = {}
+	for id, v in pairs(Library.Flags) do
+		data[id] = packValue(v)
+	end
+
+	local ok, encoded = pcall(HttpService.JSONEncode, HttpService, data)
+	if not ok then return false, encoded end
+
+	local wrote = pcall(function()
+		if makefolder and isfolder and not isfolder(CONFIG_DIR) then
+			makefolder(CONFIG_DIR)
+		end
+		writefile(CONFIG_DIR .. "/" .. name .. ".json", encoded)
+	end)
+
+	return wrote
+end
+
+function Library:LoadConfig(name)
+	name = name or "default"
+	if not (readfile and isfile) then return false end
+
+	local ok, content = pcall(function()
+		if not isfile(CONFIG_DIR .. "/" .. name .. ".json") then return nil end
+		return readfile(CONFIG_DIR .. "/" .. name .. ".json")
+	end)
+	if not ok or not content then return false end
+
+	local ok2, data = pcall(HttpService.JSONDecode, HttpService, content)
+	if not ok2 or type(data) ~= "table" then return false end
+
+	for id, v in pairs(data) do
+		local api = Library._registry[id]
+		if api and api.Set then
+			pcall(api.Set, api, unpackValue(v), true)
+		end
+	end
+
+	return true
+end
+
+function Library:ListConfigs()
+	local out = {}
+	pcall(function()
+		if listfiles and isfolder and isfolder(CONFIG_DIR) then
+			for _, f in listfiles(CONFIG_DIR) do
+				out[#out + 1] = (f:gsub(".*[/\\]", ""):gsub("%.json$", ""))
+			end
+		end
+	end)
+	return out
+end
+
+function Library:EnableAutoSave(name, delay)
+	Library._autoSave = { name = name or "autosave", delay = delay or 1.5 }
+end
+
+local autosavePending = false
+function Library:_touchAutoSave()
+	if not Library._autoSave or autosavePending then return end
+	autosavePending = true
+	task.delay(Library._autoSave.delay, function()
+		autosavePending = false
+		Library:SaveConfig(Library._autoSave.name)
+	end)
+end
+
+function Library:_bind(id, api)
+	if id then Library._registry[id] = api end
+end
+
+function Library:_flag(id, value)
+	if not id then return end
+	Library.Flags[id] = value
+	Library:_touchAutoSave()
+end
+
+function Library:_unbind(id)
+	if id then Library._registry[id] = nil end
+end
+
+----------------------------------------------------------------------
+-- NOTIFY
+----------------------------------------------------------------------
 function Library:Notify(ncfg)
 	ncfg = ncfg or {}
+
+	local spec = Library.NotifyTypes[ncfg.Type or "Info"] or Library.NotifyTypes.Info
 
 	local holder = create("Frame", {
 		BackgroundTransparency = 1,
@@ -335,7 +531,7 @@ function Library:Notify(ncfg)
 
 	local bar = create("Frame", {
 		Size = UDim2.new(0, 3, 1, 0),
-		BackgroundColor3 = Theme.Accent,
+		BackgroundColor3 = ncfg.Accent or spec.Color,
 		BorderSizePixel = 0,
 		Parent = card,
 	})
@@ -353,8 +549,27 @@ function Library:Notify(ncfg)
 			PaddingLeft = UDim.new(0, 14),
 			PaddingRight = UDim.new(0, 12),
 		}),
+		create("UIListLayout", {
+			Padding = UDim.new(0, 4),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			FillDirection = Enum.FillDirection.Horizontal,
+			VerticalAlignment = Enum.VerticalAlignment.Top,
+		}),
+	})
+
+	local col = create("Frame", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, -22, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = 2,
+		Parent = pad,
+	}, {
 		create("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }),
 	})
+
+	local ic = icon(spec.Icon, 14, ncfg.Accent or spec.Color)
+	ic.LayoutOrder = 1
+	ic.Parent = pad
 
 	create("TextLabel", {
 		BackgroundTransparency = 1,
@@ -367,7 +582,7 @@ function Library:Notify(ncfg)
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextWrapped = true,
 		LayoutOrder = 1,
-		Parent = pad,
+		Parent = col,
 	})
 
 	if ncfg.Content then
@@ -382,13 +597,25 @@ function Library:Notify(ncfg)
 			TextXAlignment = Enum.TextXAlignment.Left,
 			TextWrapped = true,
 			LayoutOrder = 2,
-			Parent = pad,
+			Parent = col,
 		})
 	end
 
 	tween(card, TI_S, { BackgroundTransparency = 0, Position = UDim2.new(0, 0, 0, 0) })
 
-	task.delay(ncfg.Duration or 4, function()
+	local lifetime = ncfg.Duration or 4
+	local conn
+	if ncfg.Callback then
+		conn = card.InputBegan:Connect(function(i)
+			if i.UserInputType == Enum.UserInputType.MouseButton1
+				or i.UserInputType == Enum.UserInputType.Touch then
+				task.spawn(ncfg.Callback)
+			end
+		end)
+	end
+
+	task.delay(lifetime, function()
+		if conn then conn:Disconnect() end
 		tween(card, TI, { BackgroundTransparency = 1, Position = UDim2.new(0, 26, 0, 0) })
 		task.wait(0.2)
 		holder:Destroy()
@@ -403,21 +630,119 @@ TabMethods.__index = TabMethods
 
 local function newRow(Tab, height)
 	Tab._order += 1
+	local T = Tab._theme
+
 	local row = create("Frame", {
 		Name = "Row",
 		Size = UDim2.new(1, 0, 0, height or 34),
-		BackgroundColor3 = Theme.Secondary,
+		BackgroundColor3 = T.Secondary,
 		BorderSizePixel = 0,
 		LayoutOrder = Tab._order,
 		Parent = Tab._page,
 	})
 	corner(row, 6)
-	stroke(row, Theme.Stroke, STROKE_T)
+	stroke(row, T.Stroke, STROKE_T)
 	return row
+end
+
+local function nextOrder(Tab)
+	Tab._order += 1
+	return Tab._order
+end
+
+----------------------------------------------------------------------
+function TabMethods:CreateSection(scfg)
+	scfg = type(scfg) == "string" and { Name = scfg } or (scfg or {})
+
+	local wrap = create("Frame", {
+		Name = "Section",
+		Size = UDim2.new(1, 0, 0, 22),
+		BackgroundTransparency = 1,
+		LayoutOrder = nextOrder(self),
+		Parent = self._page,
+	}, {
+		create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			Padding = UDim.new(0, 6),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+	})
+
+	local ic = icon(scfg.Icon or "circle", 11, self._theme.Accent)
+	ic.LayoutOrder = 1
+	ic.Parent = wrap
+
+	local lbl = create("TextLabel", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(0, 0, 1, 0),
+		AutomaticSize = Enum.AutomaticSize.X,
+		FontFace = FONT,
+		Text = string.upper(scfg.Name or "Section"),
+		TextSize = 11,
+		TextColor3 = self._theme.SubText,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		LayoutOrder = 2,
+		Parent = wrap,
+	})
+
+	local line = create("Frame", {
+		Size = UDim2.new(1, 0, 0, 1),
+		BackgroundColor3 = self._theme.Stroke,
+		BorderSizePixel = 0,
+		LayoutOrder = 3,
+		Parent = wrap,
+	})
+
+	local api = { Instance = wrap }
+	function api:Set(t) lbl.Text = string.upper(t or "") end
+	return api
+end
+
+function TabMethods:CreateDivider(dcfg)
+	dcfg = dcfg or {}
+	local d = create("Frame", {
+		Name = "Divider",
+		Size = UDim2.new(1, 0, 0, dcfg.Thickness or 1),
+		BackgroundColor3 = self._theme.Stroke,
+		BorderSizePixel = 0,
+		BackgroundTransparency = dcfg.Transparency or 0,
+		LayoutOrder = nextOrder(self),
+		Parent = self._page,
+	})
+	return { Instance = d }
+end
+
+function TabMethods:CreateParagraph(pcfg)
+	pcfg = type(pcfg) == "string" and { Text = pcfg } or (pcfg or {})
+
+	local lbl = create("TextLabel", {
+		Name = "Paragraph",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		FontFace = FONT_REG,
+		Text = pcfg.Text or "",
+		TextSize = 12,
+		TextColor3 = pcfg.Color or self._theme.SubText,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		TextWrapped = true,
+		LayoutOrder = nextOrder(self),
+		Parent = self._page,
+	}, {
+		create("UIPadding", { PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 2) }),
+	})
+
+	local api = { Instance = lbl }
+	function api:Set(t) lbl.Text = t or "" end
+	function api:Get() return lbl.Text end
+	return api
 end
 
 function TabMethods:CreateLabel(text)
 	self._order += 1
+
 	local row = create("Frame", {
 		Name = "Label",
 		Size = UDim2.new(1, 0, 0, 0),
@@ -437,7 +762,7 @@ function TabMethods:CreateLabel(text)
 		FontFace = FONT,
 		Text = text or "",
 		TextSize = 13,
-		TextColor3 = Theme.SubText,
+		TextColor3 = self._theme.SubText,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextWrapped = true,
 		Parent = row,
@@ -445,11 +770,13 @@ function TabMethods:CreateLabel(text)
 
 	local api = { Instance = row }
 	function api:Set(t) lbl.Text = t or "" end
+	function api:Get() return lbl.Text end
 	return api
 end
 
 function TabMethods:CreateWarning(text)
 	self._order += 1
+
 	local row = create("Frame", {
 		Name = "Warning",
 		Size = UDim2.new(1, 0, 0, 0),
@@ -463,7 +790,12 @@ function TabMethods:CreateWarning(text)
 			PaddingTop = UDim.new(0, 9), PaddingBottom = UDim.new(0, 9),
 			PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12),
 		}),
-		create("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }),
+		create("UIListLayout", {
+			Padding = UDim.new(0, 6),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			FillDirection = Enum.FillDirection.Horizontal,
+			VerticalAlignment = Enum.VerticalAlignment.Top,
+		}),
 	})
 	corner(row, 6)
 	stroke(row, Color3.fromRGB(120, 92, 40), STROKE_T)
@@ -472,9 +804,9 @@ function TabMethods:CreateWarning(text)
 	ic.LayoutOrder = 1
 	ic.Parent = row
 
-	create("TextLabel", {
+	local lbl = create("TextLabel", {
 		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 0),
+		Size = UDim2.new(1, -22, 0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		FontFace = FONT_REG,
 		Text = text or "",
@@ -485,26 +817,62 @@ function TabMethods:CreateWarning(text)
 		LayoutOrder = 2,
 		Parent = row,
 	})
+
+	local api = { Instance = row }
+	function api:Set(t) lbl.Text = t or "" end
+	return api
 end
 
 function TabMethods:CreateButton(bcfg)
-	bcfg = bcfg or {}
+	bcfg = type(bcfg) == "string" and { Name = bcfg } or (bcfg or {})
+	local T = self._theme
+
+	local variant = bcfg.Variant or "Normal"
+	local baseColor = variant == "Accent" and T.Accent
+		or variant == "Danger" and Color3.fromRGB(120, 40, 40)
+		or T.Tertiary
+	local hoverColor = variant == "Accent" and T.Accent:Lerp(Color3.new(1, 1, 1), 0.15)
+		or variant == "Danger" and Color3.fromRGB(150, 55, 55)
+		or T.Stroke
+
 	local btn = newRow(self, 34)
 	btn.Name = "Button"
-	btn.BackgroundColor3 = Theme.Tertiary
+	btn.BackgroundColor3 = baseColor
 
-	create("TextLabel", {
+	local pad = create("Frame", {
 		BackgroundTransparency = 1,
 		Size = UDim2.new(1, 0, 1, 0),
+		Parent = btn,
+	}, {
+		create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			HorizontalAlignment = Enum.HorizontalAlignment.Center,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			Padding = UDim.new(0, 7),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+	})
+
+	if bcfg.Icon then
+		local ic = icon(bcfg.Icon, 13, T.Text)
+		ic.LayoutOrder = 1
+		ic.Parent = pad
+	end
+
+	local lbl = create("TextLabel", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(0, 0, 1, 0),
+		AutomaticSize = Enum.AutomaticSize.X,
 		FontFace = FONT,
 		Text = bcfg.Name or "Button",
 		TextSize = 13,
-		TextColor3 = Theme.Text,
-		Parent = btn,
+		TextColor3 = T.Text,
+		LayoutOrder = 2,
+		Parent = pad,
 	})
 
-	btn.MouseEnter:Connect(function() tween(btn, TI, { BackgroundColor3 = Theme.Stroke }) end)
-	btn.MouseLeave:Connect(function() tween(btn, TI, { BackgroundColor3 = Theme.Tertiary }) end)
+	btn.MouseEnter:Connect(function() tween(btn, TI, { BackgroundColor3 = hoverColor }) end)
+	btn.MouseLeave:Connect(function() tween(btn, TI, { BackgroundColor3 = baseColor }) end)
 
 	local hit = create("TextButton", {
 		Size = UDim2.new(1, 0, 1, 0),
@@ -512,15 +880,32 @@ function TabMethods:CreateButton(bcfg)
 		Text = "",
 		Parent = btn,
 	})
+
+	local api = { Instance = btn }
+
+	function api:Set(text)
+		lbl.Text = text or ""
+	end
+
 	hit.Activated:Connect(function()
-		if bcfg.Callback then task.spawn(bcfg.Callback) end
+		if bcfg.Callback then
+			task.spawn(function()
+				local ok, err = pcall(bcfg.Callback)
+				if not ok then
+					Library:Notify({ Title = "Callback error", Content = tostring(err), Type = "Error" })
+				end
+			end)
+		end
 	end)
 
-	return { Instance = btn }
+	return api
 end
 
 function TabMethods:CreateToggle(tcfg)
 	tcfg = tcfg or {}
+	local T = self._theme
+	local id = tcfg.Id or tcfg.Name
+
 	local row = newRow(self, 34)
 	row.Name = "Toggle"
 
@@ -531,7 +916,7 @@ function TabMethods:CreateToggle(tcfg)
 		FontFace = FONT,
 		Text = tcfg.Name or "Toggle",
 		TextSize = 13,
-		TextColor3 = Theme.Text,
+		TextColor3 = T.Text,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Parent = row,
 	})
@@ -540,7 +925,7 @@ function TabMethods:CreateToggle(tcfg)
 		AnchorPoint = Vector2.new(1, 0.5),
 		Position = UDim2.new(1, -12, 0.5, 0),
 		Size = UDim2.fromOffset(34, 18),
-		BackgroundColor3 = Theme.Tertiary,
+		BackgroundColor3 = T.Tertiary,
 		BorderSizePixel = 0,
 		Parent = row,
 	})
@@ -550,13 +935,13 @@ function TabMethods:CreateToggle(tcfg)
 		AnchorPoint = Vector2.new(0, 0.5),
 		Position = UDim2.new(0, 2, 0.5, 0),
 		Size = UDim2.fromOffset(14, 14),
-		BackgroundColor3 = Theme.Text,
+		BackgroundColor3 = T.Text,
 		BorderSizePixel = 0,
 		Parent = trackBg,
 	})
 	corner(knob, 7)
 
-	local state = tcfg.Default or false
+	local state = not not tcfg.Default
 	local api = { Instance = row, State = state }
 
 	function api:Get() return state end
@@ -564,13 +949,12 @@ function TabMethods:CreateToggle(tcfg)
 	function api:Set(v, silent)
 		state = not not v
 		api.State = state
-		tween(trackBg, TI, { BackgroundColor3 = state and Theme.Accent or Theme.Tertiary })
+		tween(trackBg, TI, { BackgroundColor3 = state and T.Accent or T.Tertiary })
 		tween(knob, TI, {
 			Position = state and UDim2.new(1, -16, 0.5, 0) or UDim2.new(0, 2, 0.5, 0),
 		})
-		if not silent and tcfg.Callback then
-			task.spawn(tcfg.Callback, state)
-		end
+		Library:_flag(id, state)
+		if not silent and tcfg.Callback then task.spawn(tcfg.Callback, state) end
 	end
 
 	local hit = create("TextButton", {
@@ -581,24 +965,37 @@ function TabMethods:CreateToggle(tcfg)
 	})
 	hit.Activated:Connect(function() api:Set(not state) end)
 
-	if state then api:Set(true) end
+	-- contract: never fires the callback during construction
+	tween(trackBg, TI, { BackgroundColor3 = state and T.Accent or T.Tertiary })
+	knob.Position = state and UDim2.new(1, -16, 0.5, 0) or UDim2.new(0, 2, 0.5, 0)
+	Library:_flag(id, state)
 
+	Library:_bind(id, api)
 	return api
 end
 
 function TabMethods:CreateStat(scfg)
 	scfg = scfg or {}
+	local T = self._theme
+
 	local row = newRow(self, 34)
 	row.Name = "Stat"
 
+	if scfg.Icon then
+		local ic = icon(scfg.Icon, 13, T.SubText)
+		ic.AnchorPoint = Vector2.new(0, 0.5)
+		ic.Position = UDim2.new(0, 12, 0.5, 0)
+		ic.Parent = row
+	end
+
 	create("TextLabel", {
 		BackgroundTransparency = 1,
-		Position = UDim2.new(0, 12, 0, 0),
+		Position = UDim2.new(0, scfg.Icon and 32 or 12, 0, 0),
 		Size = UDim2.new(1, -70, 1, 0),
 		FontFace = FONT,
 		Text = scfg.Name or "Stat",
 		TextSize = 13,
-		TextColor3 = Theme.Text,
+		TextColor3 = T.Text,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Parent = row,
 	})
@@ -611,30 +1008,254 @@ function TabMethods:CreateStat(scfg)
 		FontFace = FONT,
 		Text = tostring(scfg.Value or "0"),
 		TextSize = 13,
-		TextColor3 = Theme.Accent,
+		TextColor3 = scfg.Color or T.Accent,
 		TextXAlignment = Enum.TextXAlignment.Right,
 		Parent = row,
 	})
 
 	local api = { Instance = row }
 	function api:Set(v) val.Text = tostring(v) end
+	function api:Get() return val.Text end
+	return api
+end
+
+function TabMethods:CreateProgress(pcfg)
+	pcfg = pcfg or {}
+	local T = self._theme
+
+	local min, max = pcfg.Min or 0, pcfg.Max or 100
+	local value = math.clamp(pcfg.Default or min, min, max)
+
+	local row = newRow(self, 42)
+	row.Name = "Progress"
+
+	local lbl = create("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 12, 0, 4),
+		Size = UDim2.new(1, -90, 0, 16),
+		FontFace = FONT,
+		Text = pcfg.Name or "Progress",
+		TextSize = 12,
+		TextColor3 = T.Text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	})
+
+	local pct = create("TextLabel", {
+		BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -12, 0, 4),
+		Size = UDim2.new(0, 80, 0, 16),
+		FontFace = FONT_REG,
+		Text = "0%",
+		TextSize = 12,
+		TextColor3 = T.SubText,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = row,
+	})
+
+	local bar = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 1, -14),
+		Size = UDim2.new(1, -24, 0, 6),
+		BackgroundColor3 = T.Tertiary,
+		BorderSizePixel = 0,
+		Parent = row,
+	})
+	corner(bar, 3)
+
+	local fill = create("Frame", {
+		Size = UDim2.new(0, 0, 1, 0),
+		BackgroundColor3 = pcfg.Color or T.Accent,
+		BorderSizePixel = 0,
+		Parent = bar,
+	})
+	corner(fill, 3)
+
+	local api = { Instance = row }
+
+	local function render()
+		local a = (max - min == 0) and 0 or (value - min) / (max - min)
+		fill.Size = UDim2.new(a, 0, 1, 0)
+		pct.Text = string.format("%d%%", math.floor(a * 100 + 0.5))
+	end
+
+	render()
+
+	function api:Set(v)
+		value = math.clamp(v, min, max)
+		render()
+	end
+	function api:Get() return value end
+	function api:SetLabel(t) lbl.Text = t end
+
+	return api
+end
+
+function TabMethods:CreateImage(icfg)
+	icfg = icfg or {}
+
+	local holder = create("Frame", {
+		Name = "Image",
+		Size = UDim2.new(1, 0, 0, icfg.Height or 120),
+		BackgroundColor3 = self._theme.Tertiary,
+		BorderSizePixel = 0,
+		LayoutOrder = nextOrder(self),
+		Parent = self._page,
+		ClipsDescendants = true,
+	})
+	corner(holder, 6)
+	stroke(holder, self._theme.Stroke, STROKE_T)
+
+	local img = create("ImageLabel", {
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		Image = icfg.Image or "",
+		ScaleType = icfg.ScaleType or Enum.ScaleType.Crop,
+		Parent = holder,
+	})
+	corner(img, 6)
+
+	local api = { Instance = holder }
+	function api:Set(id) img.Image = id end
+	function api:Get() return img.Image end
+	return api
+end
+
+function TabMethods:CreateKeybind(kcfg)
+	kcfg = kcfg or {}
+	local T = self._theme
+	local id = kcfg.Id or kcfg.Name
+
+	local row = newRow(self, 34)
+	row.Name = "Keybind"
+
+	create("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 12, 0, 0),
+		Size = UDim2.new(1, -90, 1, 0),
+		FontFace = FONT,
+		Text = kcfg.Name or "Keybind",
+		TextSize = 13,
+		TextColor3 = T.Text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	})
+
+	local box = create("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -12, 0.5, 0),
+		Size = UDim2.fromOffset(78, 22),
+		BackgroundColor3 = T.Tertiary,
+		BorderSizePixel = 0,
+		Text = "",
+		AutoButtonColor = false,
+		Parent = row,
+	})
+	corner(box, 5)
+
+	local lbl = create("TextLabel", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 1, 0),
+		FontFace = FONT_REG,
+		Text = "None",
+		TextSize = 12,
+		TextColor3 = T.SubText,
+		Parent = box,
+	})
+
+	local key = kcfg.Default
+	local listening = false
+	local held = false
+
+	local api = { Instance = row, Key = key }
+
+	local function label()
+		if not key then
+			lbl.Text = "None"
+			lbl.TextColor3 = T.SubText
+			return
+		end
+		lbl.Text = tostring(key):gsub("^Enum.KeyCode%.", "")
+		lbl.TextColor3 = T.Accent
+	end
+
+	label()
+
+	function api:Set(k, silent)
+		key = k
+		api.Key = k
+		label()
+		Library:_flag(id, key and tostring(key) or nil)
+		if not silent and kcfg.Callback then task.spawn(kcfg.Callback, k) end
+	end
+
+	function api:Get() return key end
+
+	box.Activated:Connect(function()
+		listening = true
+		lbl.Text = "..."
+		lbl.TextColor3 = T.Accent
+	end)
+
+	track(UserInputService.InputBegan:Connect(function(input, gpe)
+		if listening then
+			if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+			listening = false
+			if input.KeyCode == Enum.KeyCode.Backspace then
+				api:Set(nil)
+			else
+				api:Set(input.KeyCode)
+			end
+			return
+		end
+
+		if gpe or not key then return end
+		if input.KeyCode ~= key then return end
+
+		if kcfg.Hold then
+			if not held then
+				held = true
+				if kcfg.Callback then task.spawn(kcfg.Callback, true) end
+			end
+		elseif kcfg.Callback then
+			task.spawn(kcfg.Callback, false)
+		end
+	end))
+
+	track(UserInputService.InputEnded:Connect(function(input)
+		if kcfg.Hold and input.KeyCode == key and held then
+			held = false
+			if kcfg.Callback then task.spawn(kcfg.Callback, false) end
+		end
+	end))
+
+	Library:_bind(id, api)
 	return api
 end
 
 function TabMethods:CreateSlider(scfg)
 	scfg = scfg or {}
+	local T = self._theme
+	local id = scfg.Id or scfg.Name
 
 	local min, max = scfg.Min or 0, scfg.Max or 100
 	local inc = scfg.Increment
 	if not inc or inc <= 0 then inc = 1 end
 	local value = math.clamp(scfg.Default or min, min, max)
 
+	local function places()
+		if inc >= 1 then return 0 end
+		local s = string.format("%.8f", inc):gsub("0+$", "")
+		local dot = s:find("%.")
+		return dot and (#s - dot) or 0
+	end
+
+	local DEC = places()
+
 	local function fmt(n)
-		if inc < 1 then
-			local places = math.max(0, math.ceil(-math.log10(inc)))
-			return string.format("%." .. tostring(places) .. "f", n)
-		end
-		return tostring(math.floor(n + 0.5))
+		if DEC == 0 then return tostring(math.floor(n + 0.5)) end
+		return string.format("%." .. DEC .. "f", n)
 	end
 
 	local row = newRow(self, 48)
@@ -643,41 +1264,69 @@ function TabMethods:CreateSlider(scfg)
 	create("TextLabel", {
 		BackgroundTransparency = 1,
 		Position = UDim2.new(0, 12, 0, 4),
-		Size = UDim2.new(1, -90, 0, 18),
+		Size = UDim2.new(1, -96, 0, 18),
 		FontFace = FONT,
 		Text = scfg.Name or "Slider",
 		TextSize = 13,
-		TextColor3 = Theme.Text,
+		TextColor3 = T.Text,
 		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	})
+
+	local valBtn = create("TextButton", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -12, 0, 4),
+		Size = UDim2.new(0, 84, 0, 18),
+		BackgroundTransparency = 1,
+		Text = "",
+		AutoButtonColor = false,
 		Parent = row,
 	})
 
 	local valLbl = create("TextLabel", {
 		BackgroundTransparency = 1,
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -12, 0, 4),
-		Size = UDim2.new(0, 80, 0, 18),
+		Size = UDim2.new(1, 0, 1, 0),
 		FontFace = FONT_REG,
-		Text = fmt(value),
+		Text = fmt(value) .. (scfg.Suffix or ""),
 		TextSize = 12,
-		TextColor3 = Theme.SubText,
+		TextColor3 = T.SubText,
 		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = valBtn,
+	})
+
+	local valBox = create("TextBox", {
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		FontFace = FONT_REG,
+		Text = "",
+		TextSize = 12,
+		TextColor3 = T.Accent,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Visible = false,
+		ClearTextOnFocus = false,
+		Parent = valBtn,
+	})
+
+	local barWrap = create("Frame", {
+		Position = UDim2.new(0, 12, 1, -24),
+		Size = UDim2.new(1, -24, 0, 20),
+		BackgroundTransparency = 1,
 		Parent = row,
 	})
 
 	local barBg = create("Frame", {
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.new(0.5, 0, 1, -14),
-		Size = UDim2.new(1, -24, 0, 6),
-		BackgroundColor3 = Theme.Tertiary,
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 0, 0.5, 0),
+		Size = UDim2.new(1, 0, 0, 6),
+		BackgroundColor3 = T.Tertiary,
 		BorderSizePixel = 0,
-		Parent = row,
+		Parent = barWrap,
 	})
 	corner(barBg, 3)
 
 	local fill = create("Frame", {
 		Size = UDim2.new(0, 0, 1, 0),
-		BackgroundColor3 = Theme.Accent,
+		BackgroundColor3 = T.Accent,
 		BorderSizePixel = 0,
 		Parent = barBg,
 	})
@@ -686,41 +1335,75 @@ function TabMethods:CreateSlider(scfg)
 	local knob = create("Frame", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
 		Size = UDim2.fromOffset(12, 12),
-		BackgroundColor3 = Theme.Text,
+		BackgroundColor3 = T.Text,
 		BorderSizePixel = 0,
 		Parent = barBg,
 	})
 	corner(knob, 6)
-	stroke(knob, Theme.Background, 2)
+	stroke(knob, T.Background, 2)
 
 	local api = { Instance = row }
+	local span = max - min
 
-	local function apply(a, fire)
-		a = math.clamp(a, 0, 1)
-		value = math.clamp(math.floor((min + (max - min) * a) / inc + 0.5) * inc, min, max)
+	local function snap(raw)
+		-- measured from Min, not from 0 -- Min is now actually reachable
+		local steps = math.floor((math.clamp(raw, min, max) - min) / inc + 0.5)
+		return math.clamp(min + steps * inc, min, max)
+	end
+
+	local function render(fire)
+		local a = span == 0 and 0 or (value - min) / span
 		fill.Size = UDim2.new(a, 0, 1, 0)
 		knob.Position = UDim2.new(a, 0, 0.5, 0)
-		valLbl.Text = fmt(value)
+		valLbl.Text = fmt(value) .. (scfg.Suffix or "")
+		Library:_flag(id, value)
 		if fire and scfg.Callback then task.spawn(scfg.Callback, value) end
 	end
 
-	local span = max - min
-	apply(span == 0 and 0 or (value - min) / span)
+	render(false)
 
-	bindDrag(barBg, function(nx) apply(nx, true) end)
+	-- the whole 20px strip is grabbable now, not just the 6px bar
+	bindDrag(barWrap, function(nx)
+		value = snap(min + span * nx)
+		render(true)
+	end)
 
-	function api:Set(v)
-		local s = max - min
-		apply(s == 0 and 0 or (math.clamp(v, min, max) - min) / s, true)
+	valBtn.Activated:Connect(function()
+		valLbl.Visible = false
+		valBox.Visible = true
+		valBox.Text = fmt(value)
+		valBox:CaptureFocus()
+	end)
+
+	local function commit()
+		local n = tonumber(valBox.Text)
+		if n then
+			value = snap(n)
+			render(true)
+		end
+		valBox.Visible = false
+		valLbl.Visible = true
+	end
+
+	valBox.FocusLost:Connect(commit)
+	valBox.ReturnPressedFromOnScreenKeyboard:Connect(commit)
+
+	function api:Set(v, silent)
+		value = snap(v)
+		render(not silent)
 	end
 
 	function api:Get() return value end
 
+	Library:_bind(id, api)
 	return api
 end
 
 function TabMethods:CreateTextbox(tcfg)
 	tcfg = tcfg or {}
+	local T = self._theme
+	local id = tcfg.Id or tcfg.Name
+
 	local row = newRow(self, 50)
 	row.Name = "Textbox"
 
@@ -731,7 +1414,7 @@ function TabMethods:CreateTextbox(tcfg)
 		FontFace = FONT,
 		Text = tcfg.Name or "Textbox",
 		TextSize = 13,
-		TextColor3 = Theme.Text,
+		TextColor3 = T.Text,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Parent = row,
 	})
@@ -739,7 +1422,7 @@ function TabMethods:CreateTextbox(tcfg)
 	local box = create("Frame", {
 		Position = UDim2.new(0, 12, 0, 25),
 		Size = UDim2.new(1, -24, 0, 18),
-		BackgroundColor3 = Theme.Tertiary,
+		BackgroundColor3 = T.Tertiary,
 		BorderSizePixel = 0,
 		Parent = row,
 	})
@@ -752,26 +1435,39 @@ function TabMethods:CreateTextbox(tcfg)
 		FontFace = FONT_REG,
 		Text = tcfg.Default or "",
 		PlaceholderText = tcfg.Placeholder or "",
-		PlaceholderColor3 = Theme.SubText,
+		PlaceholderColor3 = T.SubText,
 		TextSize = 12,
-		TextColor3 = Theme.Text,
+		TextColor3 = T.Text,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		ClearTextOnFocus = false,
 		Parent = box,
 	})
 
 	tb.FocusLost:Connect(function()
+		if tcfg.Numeric then
+			local n = tonumber(tb.Text)
+			if n then tb.Text = tostring(n) end
+		end
+		Library:_flag(id, tb.Text)
 		if tcfg.Callback then task.spawn(tcfg.Callback, tb.Text) end
 	end)
 
 	local api = { Instance = row }
-	function api:Set(t) tb.Text = t or "" end
+	function api:Set(t, silent)
+		tb.Text = t or ""
+		Library:_flag(id, tb.Text)
+		if not silent and tcfg.Callback then task.spawn(tcfg.Callback, tb.Text) end
+	end
 	function api:Get() return tb.Text end
+
+	Library:_bind(id, api)
 	return api
 end
 
 function TabMethods:CreateColorPicker(ccfg)
 	ccfg = ccfg or {}
+	local T = self._theme
+	local id = ccfg.Id or ccfg.Name
 
 	local color = ccfg.Default or Color3.fromRGB(255, 255, 255)
 	local h, s, v = color:ToHSV()
@@ -780,14 +1476,14 @@ function TabMethods:CreateColorPicker(ccfg)
 	local row = create("Frame", {
 		Name = "ColorPicker",
 		Size = UDim2.new(1, 0, 0, 36),
-		BackgroundColor3 = Theme.Secondary,
+		BackgroundColor3 = T.Secondary,
 		BorderSizePixel = 0,
 		ClipsDescendants = true,
-		LayoutOrder = (function() self._order += 1; return self._order end)(),
+		LayoutOrder = nextOrder(self),
 		Parent = self._page,
 	})
 	corner(row, 6)
-	stroke(row, Theme.Stroke, STROKE_T)
+	stroke(row, T.Stroke, STROKE_T)
 
 	local header = create("TextButton", {
 		Size = UDim2.new(1, 0, 0, 36),
@@ -804,7 +1500,7 @@ function TabMethods:CreateColorPicker(ccfg)
 		FontFace = FONT,
 		Text = ccfg.Name or "Color",
 		TextSize = 13,
-		TextColor3 = Theme.Text,
+		TextColor3 = T.Text,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Parent = header,
 	})
@@ -818,17 +1514,17 @@ function TabMethods:CreateColorPicker(ccfg)
 		Parent = header,
 	})
 	corner(preview, 4)
-	stroke(preview, Theme.Stroke, STROKE_T)
+	stroke(preview, T.Stroke, STROKE_T)
 
 	local body = create("Frame", {
 		Position = UDim2.new(0, 12, 0, 40),
-		Size = UDim2.new(1, -24, 0, 124),
+		Size = UDim2.new(1, -24, 0, 152),
 		BackgroundTransparency = 1,
 		Parent = row,
 	})
 
 	local sv = create("Frame", {
-		Size = UDim2.new(1, -26, 1, 0),
+		Size = UDim2.new(1, -26, 0, 104),
 		BackgroundColor3 = Color3.fromHSV(h, 1, 1),
 		BorderSizePixel = 0,
 		Parent = body,
@@ -879,7 +1575,7 @@ function TabMethods:CreateColorPicker(ccfg)
 
 	local hue = create("Frame", {
 		Position = UDim2.new(1, -18, 0, 0),
-		Size = UDim2.new(0, 14, 1, 0),
+		Size = UDim2.new(0, 14, 0, 104),
 		BackgroundColor3 = Color3.new(1, 1, 1),
 		BorderSizePixel = 0,
 		Parent = body,
@@ -910,70 +1606,156 @@ function TabMethods:CreateColorPicker(ccfg)
 	corner(hueCursor, 2)
 	stroke(hueCursor, Color3.new(0, 0, 0), 2)
 
-	local api = { Instance = row }
+	local hexBox = create("TextBox", {
+		Position = UDim2.new(0, 0, 0, 112),
+		Size = UDim2.new(1, -26, 0, 22),
+		BackgroundColor3 = T.Tertiary,
+		BorderSizePixel = 0,
+		FontFace = FONT_REG,
+		Text = "",
+		PlaceholderText = "#RRGGBB",
+		PlaceholderColor3 = T.SubText,
+		TextSize = 12,
+		TextColor3 = T.Text,
+		ClearTextOnFocus = false,
+		Parent = body,
+	})
+	corner(hexBox, 4)
 
-	local function refresh()
+	local presets = ccfg.Presets or {
+		Color3.fromRGB(100, 160, 255),
+		Color3.fromRGB(120, 90, 255),
+		Color3.fromRGB(90, 200, 130),
+		Color3.fromRGB(235, 180, 80),
+		Color3.fromRGB(235, 95, 95),
+		Color3.fromRGB(240, 240, 245),
+	}
+
+	local presetRow = create("Frame", {
+		Position = UDim2.new(0, 0, 0, 112),
+		Size = UDim2.new(0, 120, 0, 22),
+		BackgroundTransparency = 1,
+		Parent = body,
+	}, {
+		create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			Padding = UDim.new(0, 4),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+	})
+
+	hexBox.Position = UDim2.new(0, 128, 0, 112)
+	hexBox.Size = UDim2.new(1, -128, 0, 22)
+
+	local api = { Instance = row, Color = color }
+
+	local function refresh(fire)
 		local c = Color3.fromHSV(h, s, v)
+		api.Color = c
 		preview.BackgroundColor3 = c
 		sv.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
 		svCursor.Position = UDim2.new(s, 0, 1 - v, 0)
 		hueCursor.Position = UDim2.new(0.5, 0, h, 0)
-		api.Color = c
+		if not hexBox:IsFocused() then
+			hexBox.Text = string.format("#%02X%02X%02X",
+				math.floor(c.R * 255 + 0.5),
+				math.floor(c.G * 255 + 0.5),
+				math.floor(c.B * 255 + 0.5))
+		end
+		Library:_flag(id, c)
+		if fire and ccfg.Callback then task.spawn(ccfg.Callback, c) end
 	end
 
-	refresh()
+	for i, pc in presets do
+		local sw = create("TextButton", {
+			Size = UDim2.fromOffset(18, 22),
+			BackgroundColor3 = pc,
+			BorderSizePixel = 0,
+			Text = "",
+			AutoButtonColor = false,
+			LayoutOrder = i,
+			Parent = presetRow,
+		})
+		corner(sw, 4)
+		sw.Activated:Connect(function()
+			h, s, v = pc:ToHSV()
+			refresh(true)
+		end)
+	end
+
+	refresh(false)
 
 	bindDrag(sv, function(nx, ny)
 		s = nx
 		v = 1 - ny
-		refresh()
-		if ccfg.Callback then task.spawn(ccfg.Callback, Color3.fromHSV(h, s, v)) end
+		refresh(true)
 	end)
 
 	bindDrag(hue, function(_, ny)
 		h = ny
-		refresh()
-		if ccfg.Callback then task.spawn(ccfg.Callback, Color3.fromHSV(h, s, v)) end
+		refresh(true)
+	end)
+
+	hexBox.FocusLost:Connect(function()
+		local hex = hexBox.Text:gsub("#", "")
+		if #hex == 6 then
+			local ok, c = pcall(Color3.fromHex, hex)
+			if ok and c then
+				h, s, v = c:ToHSV()
+				refresh(true)
+				return
+			end
+		end
+		refresh(false)
 	end)
 
 	header.Activated:Connect(function()
 		open = not open
-		tween(row, TI, { Size = UDim2.new(1, 0, 0, open and 172 or 36) })
+		tween(row, TI, { Size = UDim2.new(1, 0, 0, open and 200 or 36) })
 	end)
 
-	function api:Set(c)
+	function api:Set(c, silent)
 		h, s, v = c:ToHSV()
-		refresh()
+		refresh(not silent)
 	end
 
 	function api:Get() return Color3.fromHSV(h, s, v) end
 
+	Library:_bind(id, api)
 	return api
 end
 
 function TabMethods:CreateDropdown(dcfg)
 	dcfg = dcfg or {}
+	local T = self._theme
+	local id = dcfg.Id or dcfg.Name
 
-	local options = dcfg.Options or {}
+	local options = {}
+	for _, o in dcfg.Options or {} do
+		if o ~= nil then table.insert(options, o) end
+	end
+
 	local multi = dcfg.Multi or false
-	local selected = {}
+	local searchable = dcfg.Search or false
+	local selected = {}      -- keyed by option string, deduped
 	local optionBtns = {}
 	local open = false
 
 	local ROW_H = 36
-	local MAX_LIST = 280
+	local MAX_LIST = 260
+	local OPT_H = 28
 
 	local row = create("Frame", {
 		Name = "Dropdown",
 		Size = UDim2.new(1, 0, 0, ROW_H),
-		BackgroundColor3 = Theme.Secondary,
+		BackgroundColor3 = T.Secondary,
 		BorderSizePixel = 0,
 		ClipsDescendants = true,
-		LayoutOrder = (function() self._order += 1; return self._order end)(),
+		LayoutOrder = nextOrder(self),
 		Parent = self._page,
 	})
 	corner(row, 6)
-	stroke(row, Theme.Stroke, STROKE_T)
+	stroke(row, T.Stroke, STROKE_T)
 
 	local header = create("TextButton", {
 		Size = UDim2.new(1, 0, 0, 36),
@@ -990,7 +1772,7 @@ function TabMethods:CreateDropdown(dcfg)
 		FontFace = FONT,
 		Text = dcfg.Name or "Dropdown",
 		TextSize = 13,
-		TextColor3 = Theme.Text,
+		TextColor3 = T.Text,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Parent = header,
 	})
@@ -1001,27 +1783,49 @@ function TabMethods:CreateDropdown(dcfg)
 		Position = UDim2.new(1, -30, 0.5, 0),
 		Size = UDim2.new(0, 90, 1, 0),
 		FontFace = FONT_REG,
-		Text = "",
+		Text = dcfg.Placeholder or "",
 		TextSize = 12,
-		TextColor3 = Theme.SubText,
+		TextColor3 = T.SubText,
 		TextXAlignment = Enum.TextXAlignment.Right,
+		TextTruncate = Enum.TextTruncate.AtEnd,
 		Parent = header,
 	})
 
-	local chev = icon("chevron-down", 12, Theme.SubText)
+	local chev = icon("chevron-down", 12, T.SubText)
 	chev.AnchorPoint = Vector2.new(1, 0.5)
 	chev.Position = UDim2.new(1, -12, 0.5, 0)
 	chev.Parent = header
 
+	local searchBox
+	if searchable then
+		searchBox = create("TextBox", {
+			Position = UDim2.new(0, 8, 0, 36),
+			Size = UDim2.new(1, -16, 0, 24),
+			BackgroundColor3 = T.Tertiary,
+			BorderSizePixel = 0,
+			FontFace = FONT_REG,
+			Text = "",
+			PlaceholderText = "Search...",
+			PlaceholderColor3 = T.SubText,
+			TextSize = 12,
+			TextColor3 = T.Text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			ClearTextOnFocus = false,
+			Visible = false,
+			Parent = row,
+		})
+		corner(searchBox, 4)
+	end
+
 	local list = create("ScrollingFrame", {
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
-		Position = UDim2.new(0, 0, 0, 36),
+		Position = UDim2.new(0, 0, 0, searchable and 64 or 36),
 		Size = UDim2.new(1, 0, 0, 0),
 		CanvasSize = UDim2.new(),
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		ScrollBarThickness = 3,
-		ScrollBarImageColor3 = Theme.Stroke,
+		ScrollBarImageColor3 = T.Stroke,
 		ScrollBarImageTransparency = 0.5,
 		Visible = false,
 		Parent = row,
@@ -1034,10 +1838,21 @@ function TabMethods:CreateDropdown(dcfg)
 		}),
 	})
 
+	local api = { Instance = row }
+
+	local function visibleCount()
+		local n = 0
+		for _, b in optionBtns do
+			if b.btn.Visible then n += 1 end
+		end
+		return n
+	end
+
 	local function openHeight()
-		local n = #options
-		if n == 0 then return 44 end
-		return 36 + math.min(MAX_LIST, (n * 28) + ((n - 1) * 2) + 8)
+		local n = math.min(visibleCount(), 9)
+		if n == 0 then n = 1 end
+		local extra = searchable and 28 or 0
+		return 36 + extra + (n * OPT_H) + ((n - 1) * 2) + 8
 	end
 
 	local function selectedList()
@@ -1050,28 +1865,36 @@ function TabMethods:CreateDropdown(dcfg)
 
 	local function updateValLabel()
 		local names = selectedList()
-		valLbl.Text = #names > 0 and table.concat(names, ", ") or ""
+		if #names == 0 then
+			valLbl.Text = dcfg.Placeholder or ""
+		elseif multi then
+			valLbl.Text = #names == 1 and names[1] or (#names .. " selected")
+		else
+			valLbl.Text = names[1]
+		end
 	end
-
-	local api = { Instance = row }
 
 	local function rebuild()
 		for _, b in optionBtns do b.btn:Destroy() end
 		table.clear(optionBtns)
 
-		local unique, seen = {}, {}
+		-- dedupe, preserving order
+		local seen, unique = {}, {}
 		for _, o in options do
-			if not seen[o] then
-				seen[o] = true
+			local k = tostring(o)
+			if not seen[k] then
+				seen[k] = true
 				table.insert(unique, o)
 			end
 		end
 		options = unique
 
 		for i, opt in options do
+			local key = tostring(opt)
+
 			local btn = create("TextButton", {
-				Size = UDim2.new(1, 0, 0, 28),
-				BackgroundColor3 = Theme.Tertiary,
+				Size = UDim2.new(1, 0, 0, OPT_H),
+				BackgroundColor3 = T.Tertiary,
 				BackgroundTransparency = 1,
 				BorderSizePixel = 0,
 				Text = "",
@@ -1081,22 +1904,23 @@ function TabMethods:CreateDropdown(dcfg)
 			})
 			corner(btn, 4)
 
-			create("TextLabel", {
+			local lbl = create("TextLabel", {
 				BackgroundTransparency = 1,
 				Position = UDim2.new(0, 10, 0, 0),
 				Size = UDim2.new(1, -40, 1, 0),
 				FontFace = FONT_REG,
 				Text = tostring(opt),
 				TextSize = 12,
-				TextColor3 = Theme.Text,
+				TextColor3 = T.Text,
 				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
 				Parent = btn,
 			})
 
-			local check = icon("check", 12, Theme.Accent)
+			local check = icon("check", 12, T.Accent)
 			check.AnchorPoint = Vector2.new(1, 0.5)
 			check.Position = UDim2.new(1, -10, 0.5, 0)
-			check.Visible = selected[opt] == true
+			check.Visible = selected[key] == true
 			check.Parent = btn
 
 			btn.MouseEnter:Connect(function() tween(btn, TI, { BackgroundTransparency = 0 }) end)
@@ -1104,72 +1928,115 @@ function TabMethods:CreateDropdown(dcfg)
 
 			btn.Activated:Connect(function()
 				if multi then
-					selected[opt] = not selected[opt]
-					check.Visible = selected[opt] == true
+					selected[key] = not selected[key]
+					check.Visible = selected[key] == true
 					updateValLabel()
+					Library:_flag(id, selectedList())
 					if dcfg.Callback then task.spawn(dcfg.Callback, selectedList()) end
 				else
 					table.clear(selected)
-					selected[opt] = true
+					selected[key] = true
+					updateValLabel()
 					rebuild()
+					Library:_flag(id, opt)
 					if dcfg.Callback then task.spawn(dcfg.Callback, opt) end
-					task.wait(0.05)
-					api._toggle(false)
+					task.delay(0.05, function()
+						if open then api._toggle(false) end
+					end)
 				end
 			end)
 
-			table.insert(optionBtns, { btn = btn, opt = opt })
+			table.insert(optionBtns, { btn = btn, opt = opt, key = key, lbl = lbl })
 		end
 
 		updateValLabel()
 	end
 
+	if searchBox then
+		searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+			local q = searchBox.Text:lower()
+			for _, b in optionBtns do
+				b.btn.Visible = q == "" or b.lbl.Text:lower():find(q, 1, true) ~= nil
+			end
+			if open then
+				list.Size = UDim2.new(1, 0, 0, openHeight() - (searchable and 64 or 36))
+				tween(row, TI, { Size = UDim2.new(1, 0, 0, openHeight()) })
+			end
+		end)
+	end
+
 	function api._toggle(force)
 		open = (force ~= nil) and force or not open
-		tween(row, TI, { Size = UDim2.new(1, 0, 0, open and openHeight() or ROW_H) })
 		if open then
-			list.Size = UDim2.new(1, 0, 0, openHeight() - 36)
 			list.Visible = true
+			if searchBox then
+				searchBox.Visible = true
+				searchBox.Text = ""
+				for _, b in optionBtns do b.btn.Visible = true end
+			end
+			list.Size = UDim2.new(1, 0, 0, openHeight() - (searchable and 64 or 36))
+			tween(row, TI, { Size = UDim2.new(1, 0, 0, openHeight()) })
 		else
 			list.Visible = false
+			if searchBox then searchBox.Visible = false end
+			tween(row, TI, { Size = UDim2.new(1, 0, 0, ROW_H) })
 		end
-		
-		task.spawn(function()
-			local success, iconString = TextService:GetIcon(Enum.IconMapping.BuilderIcons, open and "chevron-up" or "chevron-down")
-			if success then chev.Text = iconString end
-		end)
+
+		chev.Text = open and "chevron-up" or "chevron-down"
+		if not iconFontOK() then
+			chev.Text = open and GLYPHS["chevron-up"] or GLYPHS["chevron-down"]
+		end
 	end
 
 	header.Activated:Connect(function() api._toggle() end)
 
-	function api:Set(val)
+	function api:Set(val, silent)
 		table.clear(selected)
+
 		if type(val) == "table" then
-			for _, x in val do
-				if x ~= nil then selected[x] = true end
+			if multi then
+				for _, x in val do
+					if x ~= nil then selected[tostring(x)] = true end
+				end
+			else
+				-- single-select given a table: take the first entry only
+				local first = val[1]
+				if first ~= nil then selected[tostring(first)] = true end
 			end
 		elseif val ~= nil then
-			selected[val] = true
+			selected[tostring(val)] = true
 		end
+
 		rebuild()
+		Library:_flag(id, multi and selectedList() or selectedList()[1])
+		if not silent and dcfg.Callback then
+			task.spawn(dcfg.Callback, multi and selectedList() or selectedList()[1])
+		end
 	end
 
 	function api:Get()
 		local sel = selectedList()
-		return multi and sel or sel
+		return multi and sel or sel[1]
 	end
 
-	function api:Refresh(newOpts)
-		options = newOpts or options
+	function api:Refresh(newOptions)
+		if newOptions then
+			options = {}
+			for _, o in newOptions do
+				if o ~= nil then table.insert(options, o) end
+			end
+		end
 		rebuild()
+		if open then tween(row, TI, { Size = UDim2.new(1, 0, 0, openHeight()) }) end
 	end
 
 	if dcfg.Default ~= nil then
-		api:Set(dcfg.Default)
+		api:Set(dcfg.Default, true)
 	else
 		rebuild()
 	end
 
+	Library:_bind(id, api)
 	return api
 end
 
@@ -1178,11 +2045,11 @@ end
 --=========================================================================
 function Library:CreateWindow(cfg)
 	cfg = cfg or {}
-	if cfg.Accent then Theme.Accent = cfg.Accent end
 
-	local Window = { Tabs = {}, _current = nil, _dead = false }
+	local Window = { Tabs = {}, _current = nil, _dead = false, Theme = newTheme(cfg.Accent) }
 	table.insert(Library._windows, Window)
 
+	local T = Window.Theme
 	local hidden = false
 	local toggleConn
 
@@ -1191,14 +2058,18 @@ function Library:CreateWindow(cfg)
 		AnchorPoint = Vector2.new(0.5, 0.5),
 		Position = UDim2.new(0.5, 0, 0.5, 0),
 		Size = UDim2.new(0, 560, 0, 380),
-		BackgroundColor3 = Theme.Background,
+		BackgroundColor3 = T.Background,
 		BorderSizePixel = 0,
 		GroupTransparency = 1,
 		Parent = ScreenGui,
 	})
 	corner(BG, 12)
-	stroke(BG, Theme.Stroke, STROKE_T)
+	stroke(BG, T.Stroke, STROKE_T)
 	addShadow(BG, 24)
+
+	if cfg.Scale then
+		create("UIScale", { Scale = cfg.Scale, Parent = BG })
+	end
 
 	Window.Instance = BG
 
@@ -1209,22 +2080,37 @@ function Library:CreateWindow(cfg)
 		Parent = BG,
 	})
 
-	create("TextLabel", {
+	local titleLbl = create("TextLabel", {
 		BackgroundTransparency = 1,
 		Position = UDim2.new(0, 16, 0, 0),
 		Size = UDim2.new(1, -120, 1, 0),
 		FontFace = FONT,
 		Text = cfg.Title or "Window",
 		TextSize = 15,
-		TextColor3 = Theme.Text,
+		TextColor3 = T.Text,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Parent = TopBar,
 	})
 
+	if cfg.Subtitle then
+		create("TextLabel", {
+			BackgroundTransparency = 1,
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -78, 0.5, 0),
+			Size = UDim2.new(0, 90, 1, 0),
+			FontFace = FONT_REG,
+			Text = cfg.Subtitle,
+			TextSize = 11,
+			TextColor3 = T.SubText,
+			TextXAlignment = Enum.TextXAlignment.Right,
+			Parent = TopBar,
+		})
+	end
+
 	create("Frame", {
 		Position = UDim2.new(0, 0, 1, -1),
 		Size = UDim2.new(1, 0, 0, 1),
-		BackgroundColor3 = Theme.Stroke,
+		BackgroundColor3 = T.Stroke,
 		BorderSizePixel = 0,
 		Parent = TopBar,
 	})
@@ -1234,7 +2120,7 @@ function Library:CreateWindow(cfg)
 			AnchorPoint = Vector2.new(1, 0.5),
 			Position = UDim2.new(1, xOffset, 0.5, 0),
 			Size = UDim2.fromOffset(24, 24),
-			BackgroundColor3 = Theme.Tertiary,
+			BackgroundColor3 = T.Tertiary,
 			BackgroundTransparency = 1,
 			BorderSizePixel = 0,
 			Text = "",
@@ -1243,13 +2129,19 @@ function Library:CreateWindow(cfg)
 		})
 		corner(btn, 6)
 
-		local ic = icon(name, 13, Theme.SubText)
+		local ic = icon(name, 13, T.SubText)
 		ic.AnchorPoint = Vector2.new(0.5, 0.5)
 		ic.Position = UDim2.new(0.5, 0, 0.5, 0)
 		ic.Parent = btn
 
-		btn.MouseEnter:Connect(function() tween(btn, TI, { BackgroundTransparency = 0 }) end)
-		btn.MouseLeave:Connect(function() tween(btn, TI, { BackgroundTransparency = 1 }) end)
+		btn.MouseEnter:Connect(function()
+			tween(btn, TI, { BackgroundTransparency = 0 })
+			ic.TextColor3 = T.Text
+		end)
+		btn.MouseLeave:Connect(function()
+			tween(btn, TI, { BackgroundTransparency = 1 })
+			ic.TextColor3 = T.SubText
+		end)
 		btn.Activated:Connect(cb)
 
 		return btn
@@ -1278,7 +2170,7 @@ function Library:CreateWindow(cfg)
 		CanvasSize = UDim2.new(),
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		ScrollBarThickness = 2,
-		ScrollBarImageColor3 = Theme.Stroke,
+		ScrollBarImageColor3 = T.Stroke,
 		Parent = Content,
 	}, {
 		create("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }),
@@ -1295,15 +2187,16 @@ function Library:CreateWindow(cfg)
 	makeDraggable(BG, TopBar)
 
 	function Window:CreateTab(tcfg)
-		tcfg = tcfg or {}
+		tcfg = type(tcfg) == "string" and { Name = tcfg } or (tcfg or {})
 		local name = tcfg.Name or "Tab"
 
-		local Tab = setmetatable({ _order = 0 }, TabMethods)
+		local Tab = setmetatable({ _order = 0, _theme = T }, TabMethods)
+		Tab._registry = {}
 
 		local btn = create("TextButton", {
 			Name = name,
 			Size = UDim2.new(1, 0, 0, 32),
-			BackgroundColor3 = Theme.Accent,
+			BackgroundColor3 = T.Accent,
 			BackgroundTransparency = 1,
 			BorderSizePixel = 0,
 			Text = "",
@@ -1316,14 +2209,14 @@ function Library:CreateWindow(cfg)
 		local hl = create("Frame", {
 			Size = UDim2.new(0, 3, 0, 16),
 			Position = UDim2.new(0, 0, 0.5, -8),
-			BackgroundColor3 = Theme.Accent,
+			BackgroundColor3 = T.Accent,
 			BorderSizePixel = 0,
 			Visible = false,
 			Parent = btn,
 		})
 		corner(hl, 2)
 
-		local ic = icon(tcfg.Icon or "circle", 14, Theme.SubText)
+		local ic = icon(tcfg.Icon or "circle", 14, T.SubText)
 		ic.AnchorPoint = Vector2.new(0, 0.5)
 		ic.Position = UDim2.new(0, 9, 0.5, 0)
 		ic.Parent = btn
@@ -1335,8 +2228,9 @@ function Library:CreateWindow(cfg)
 			FontFace = FONT,
 			Text = name,
 			TextSize = 13,
-			TextColor3 = Theme.SubText,
+			TextColor3 = T.SubText,
 			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
 			Parent = btn,
 		})
 
@@ -1355,19 +2249,16 @@ function Library:CreateWindow(cfg)
 			CanvasSize = UDim2.new(),
 			AutomaticCanvasSize = Enum.AutomaticSize.Y,
 			ScrollBarThickness = 2,
-			ScrollBarImageColor3 = Theme.Stroke,
+			ScrollBarImageColor3 = T.Stroke,
 			Parent = pageWrap,
 		}, {
 			create("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }),
 			create("UIPadding", { PaddingRight = UDim.new(0, 6) }),
 		})
 
-		Tab._btn = btn
-		Tab._hl = hl
-		Tab._lbl = lbl
-		Tab._ic = ic
-		Tab._wrap = pageWrap
-		Tab._page = page
+		Tab._btn, Tab._hl, Tab._lbl, Tab._ic = btn, hl, lbl, ic
+		Tab._wrap, Tab._page = pageWrap, page
+		Tab.Name = name
 
 		local function select()
 			if Window._current == Tab then return end
@@ -1378,8 +2269,8 @@ function Library:CreateWindow(cfg)
 					t._wrap.GroupTransparency = 1
 					t._btn.BackgroundTransparency = 1
 					t._hl.Visible = false
-					t._lbl.TextColor3 = Theme.SubText
-					t._ic.TextColor3 = Theme.SubText
+					t._lbl.TextColor3 = T.SubText
+					t._ic.TextColor3 = T.SubText
 				end
 			end
 
@@ -1388,8 +2279,8 @@ function Library:CreateWindow(cfg)
 			tween(pageWrap, TI, { GroupTransparency = 0 })
 			btn.BackgroundTransparency = 0.85
 			hl.Visible = true
-			lbl.TextColor3 = Theme.Text
-			ic.TextColor3 = Theme.Accent
+			lbl.TextColor3 = T.Text
+			ic.TextColor3 = T.Accent
 		end
 
 		btn.Activated:Connect(select)
@@ -1406,6 +2297,63 @@ function Library:CreateWindow(cfg)
 		return Tab
 	end
 
+	function Window:SelectTab(nameOrIndex)
+		local tab
+		if type(nameOrIndex) == "number" then tab = Window.Tabs[nameOrIndex]
+		else
+			for _, t in Window.Tabs do
+				if t.Name == nameOrIndex then tab = t break end
+			end
+		end
+		if tab and tab._btn then tab._btn.Activated:Fire() end
+		return tab
+	end
+
+	function Window:RemoveTab(nameOrIndex)
+		local idx, tab
+		if type(nameOrIndex) == "number" then
+			idx, tab = nameOrIndex, Window.Tabs[nameOrIndex]
+		else
+			for i, t in Window.Tabs do
+				if t.Name == nameOrIndex then idx, tab = i, t break end
+			end
+		end
+		if not tab then return false end
+
+		tab._btn:Destroy()
+		tab._wrap:Destroy()
+		table.remove(Window.Tabs, idx)
+
+		if Window._current == tab then
+			Window._current = nil
+			if Window.Tabs[1] then
+				local nextTab = Window.Tabs[1]
+				nextTab._btn.Activated:Fire()
+			end
+		end
+		return true
+	end
+
+	function Window:SetTitle(t)
+		titleLbl.Text = t or ""
+	end
+
+	function Window:SetAccent(c)
+		Window.Theme.Accent = c
+		for _, t in Window.Tabs do t._hl.BackgroundColor3 = c end
+		if Window._current then Window._current._ic.TextColor3 = c end
+	end
+
+	function Window:SetVisible(v)
+		hidden = not v
+		BG.Visible = v
+	end
+
+	function Window:Toggle()
+		hidden = not hidden
+		BG.Visible = not hidden
+	end
+
 	function Window:Destroy()
 		if Window._dead then return end
 		Window._dead = true
@@ -1418,6 +2366,14 @@ function Library:CreateWindow(cfg)
 			toggleConn = nil
 		end
 
+		for _, tab in Window.Tabs do
+			for id, api in Library._registry do
+				if api.Instance and api.Instance:IsDescendantOf(tab._wrap) then
+					Library:_unbind(id)
+				end
+			end
+		end
+
 		tween(BG, TI, { GroupTransparency = 1, Size = UDim2.fromOffset(BG.AbsoluteSize.X, 0) })
 		task.wait(0.18)
 		BG:Destroy()
@@ -1426,8 +2382,7 @@ function Library:CreateWindow(cfg)
 	toggleConn = track(UserInputService.InputBegan:Connect(function(inp, gp)
 		if gp then return end
 		if inp.KeyCode == (cfg.ToggleKey or Enum.KeyCode.RightShift) then
-			hidden = not hidden
-			BG.Visible = not hidden
+			Window:Toggle()
 		end
 	end))
 
