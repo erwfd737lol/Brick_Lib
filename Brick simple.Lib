@@ -1,27 +1,26 @@
 --[[=========================================================================
-	BrickedLib  v2.2   (patched + expanded)
+	BrickedLib  v2.3   (patched + expanded)
 	Roblox UI library: window / tabs / elements / notifications / configs.
 
+	v2.3
+	  * FIX: "invalid argument #1 (Vector2 expected, got Vector3)" on every
+	    slider / colour-picker drag. bindDrag's fire() subtracted
+	    InputObject.Position (Vector3) from GuiObject.AbsolutePosition
+	    (Vector2). Present since the original lib -- makeDraggable never hit
+	    it because it subtracts two Vector3 positions (deltas).
+
 	v2.2
-	  * FIX: windows stuck to the cursor after a drag. The v2.1 leak fix
-	    replaced the per-input input.Changed handler with a global identity
-	    check, but the movement handler still overwrote the variable used
-	    for that check -- so the release never matched and `dragging` stayed
-	    true. Drag identity now lives in activeInput and the release is
-	    matched by input TYPE, not identity. bindDrag had the same defect
-	    (sliders / colour pickers kept tracking off-widget) -- fixed too.
+	  * FIX: windows stuck to the cursor after a drag. Drag identity now
+	    lives in activeInput and the release is matched by input TYPE, not
+	    identity. bindDrag had the same defect -- fixed too.
 	  * window focus loss now also cancels an in-progress drag.
 
 	v2.1
 	  * FIX: "Key 'Destroy' not found" -- window control buttons were wired
-	    up before the Window methods existed, so the analyzer resolved
-	    Window:Destroy() against an incomplete table. All methods are now
-	    declared before anything references them.
-	  * FIX: "Unknown global 'writeclipboard'" -- clipboard helpers now go
-	    through getgenv() instead of bare globals.
+	    up before the Window methods existed.
+	  * FIX: "Unknown global 'writeclipboard'" -- clipboard via getgenv().
 	  * FIX: "SameLineStatement" -- semicolons in SelectTab / RemoveTab.
-	  * FIX: same late-binding pattern in the dropdown (api._toggle was
-	    referenced by rebuild() before assignment).
+	  * FIX: dropdown api._toggle referenced by rebuild() before assignment.
 	  * icons: TextService:GetIcon() -> BuilderIcons font (auto glyph
 	    fallback if the font is missing on the client)
 	  * slider: snapping measured from Min, precision from Increment,
@@ -147,6 +146,14 @@ local function track(conn)
 	return conn
 end
 
+-- InputObject.Position is a Vector3 (Z = scroll delta); AbsolutePosition is
+-- a Vector2. Subtracting them directly dispatches to Vector2.__sub and errors,
+-- so every screen-space conversion goes through this.
+local function screenPos(input)
+	local p = input.Position
+	return Vector2.new(p.X, p.Y)
+end
+
 ----------------------------------------------------------------------
 -- ICON
 ----------------------------------------------------------------------
@@ -222,7 +229,7 @@ local function makeDraggable(frame, handle)
 		if not isDragStart(input) then return end
 		dragging = true
 		activeInput = input          -- never overwritten while dragging
-		startPos = input.Position
+		startPos = screenPos(input)
 		startFramePos = frame.Position
 	end)
 
@@ -244,7 +251,7 @@ local function makeDraggable(frame, handle)
 		if not dragging then return end
 		if not isDragMove(input, activeInput) then return end
 
-		local delta = input.Position - startPos
+		local delta = screenPos(input) - startPos
 		frame.Position = UDim2.new(
 			startFramePos.X.Scale, startFramePos.X.Offset + delta.X,
 			startFramePos.Y.Scale, startFramePos.Y.Offset + delta.Y)
@@ -256,7 +263,8 @@ local function bindDrag(frame, cb)
 	local activeInput = nil
 
 	local function fire(input)
-		local rel = input.Position - frame.AbsolutePosition
+		-- was: input.Position - frame.AbsolutePosition  (Vector3 - Vector2)
+		local rel = screenPos(input) - frame.AbsolutePosition
 		local nx = math.clamp(rel.X / math.max(frame.AbsoluteSize.X, 1), 0, 1)
 		local ny = math.clamp(rel.Y / math.max(frame.AbsoluteSize.Y, 1), 0, 1)
 		cb(nx, ny)
@@ -391,7 +399,7 @@ local NotifHolder = create("Frame", {
 --=========================================================================
 local Library = { _windows = {}, _registry = {}, Flags = {} }
 Library.__index = Library
-Library.Version = "2.2"
+Library.Version = "2.3"
 Library.Connections = Connections
 Library.ScreenGui = ScreenGui
 
