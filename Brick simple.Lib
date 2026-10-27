@@ -1,13 +1,22 @@
 --[[=========================================================================
-	BrickedLib  v2.3   (patched + expanded)
+	BrickedLib  v2.4   (patched + expanded)
 	Roblox UI library: window / tabs / elements / notifications / configs.
+
+	v2.4
+	  * fire() no longer depends on the screenPos helper -- it converts the
+	    input position inline and type-guards it, so a stale/partial file
+	    cannot reintroduce the Vector3 - Vector2 crash.
+	  * prints its version on load so you can tell which build is actually
+	    live. If you see no "[BrickedLib] v..." line, the hosted file is
+	    stale and your edits never reached the executor.
+	  * RE-UPLOAD REQUIRED: the loader HttpGets the lib from GitHub, so a
+	    local copy is never read.
 
 	v2.3
 	  * FIX: "invalid argument #1 (Vector2 expected, got Vector3)" on every
 	    slider / colour-picker drag. bindDrag's fire() subtracted
 	    InputObject.Position (Vector3) from GuiObject.AbsolutePosition
-	    (Vector2). Present since the original lib -- makeDraggable never hit
-	    it because it subtracts two Vector3 positions (deltas).
+	    (Vector2).
 
 	v2.2
 	  * FIX: windows stuck to the cursor after a drag. Drag identity now
@@ -146,12 +155,16 @@ local function track(conn)
 	return conn
 end
 
--- InputObject.Position is a Vector3 (Z = scroll delta); AbsolutePosition is
--- a Vector2. Subtracting them directly dispatches to Vector2.__sub and errors,
--- so every screen-space conversion goes through this.
+-- InputObject.Position is a Vector3 (Z = scroll delta); AbsolutePosition is a
+-- Vector2. Subtracting them directly dispatches to Vector2.__sub and errors.
+-- The typeof guard means this stays correct even if the input is already a
+-- Vector2 (some executor builds hand back a Vector2 for touch).
 local function screenPos(input)
 	local p = input.Position
-	return Vector2.new(p.X, p.Y)
+	if typeof(p) == "Vector3" then
+		return Vector2.new(p.X, p.Y)
+	end
+	return p
 end
 
 ----------------------------------------------------------------------
@@ -263,8 +276,13 @@ local function bindDrag(frame, cb)
 	local activeInput = nil
 
 	local function fire(input)
-		-- was: input.Position - frame.AbsolutePosition  (Vector3 - Vector2)
-		local rel = screenPos(input) - frame.AbsolutePosition
+		-- self-contained conversion: does not rely on screenPos being present
+		local p = input.Position
+		if typeof(p) == "Vector3" then
+			p = Vector2.new(p.X, p.Y)
+		end
+
+		local rel = p - frame.AbsolutePosition
 		local nx = math.clamp(rel.X / math.max(frame.AbsoluteSize.X, 1), 0, 1)
 		local ny = math.clamp(rel.Y / math.max(frame.AbsoluteSize.Y, 1), 0, 1)
 		cb(nx, ny)
@@ -399,7 +417,7 @@ local NotifHolder = create("Frame", {
 --=========================================================================
 local Library = { _windows = {}, _registry = {}, Flags = {} }
 Library.__index = Library
-Library.Version = "2.3"
+Library.Version = "2.4"
 Library.Connections = Connections
 Library.ScreenGui = ScreenGui
 
@@ -2434,4 +2452,8 @@ function Library:CreateWindow(cfg)
 end
 
 --=========================================================================
+-- version stamp -- if this line never prints, the hosted file is stale
+--=========================================================================
+print("[BrickedLib] v" .. Library.Version .. " loaded")
+
 return Library
